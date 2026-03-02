@@ -9,8 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "canvas2svg": "^1.0.16",
-    "pdfjs-dist": "^5.5.207",
+    "pdfjs-dist": "^3.11.174",
     "svgo": "^4.0.0"
   },
   "devDependencies": {

@@ -14,8 +14,7 @@
 
 import './app.css';
 import * as pdfjsLib from 'pdfjs-dist';
-import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import C2S from 'canvas2svg';
+import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.js?url';
 import { optimize as svgOptimize } from 'svgo/browser';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
@@ -122,7 +121,6 @@ class PdfCropper {
     // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
       if (!this.pdfDoc) return;
-      // Ignore if user is typing in the page input
       if (document.activeElement === this.pageInput) return;
 
       if (e.key === 'ArrowLeft') {
@@ -148,7 +146,7 @@ class PdfCropper {
 
   async loadPDF(data) {
     try {
-      this.pdfDoc = await pdfjsLib.getDocument({ data }).promise;
+      this.pdfDoc = await pdfjsLib.getDocument(data).promise;
       this.pageNum = 1;
 
       // Show the app, hide drop zone
@@ -274,7 +272,6 @@ class PdfCropper {
     }
 
     if (!this.isDragging) {
-      // Update cursor when hovering over selection
       if (this.selectionRect) {
         const pos = this.getContainerPos(e);
         this.container.style.cursor = this.isInsideSelection(pos.x, pos.y) ? 'move' : 'crosshair';
@@ -336,99 +333,7 @@ class PdfCropper {
     this.statusText.textContent = 'Drag to select a region';
   }
 
-  // -------- SVG export via canvas2svg --------
-
-  /**
-   * Creates a Proxy around canvas2svg that gracefully handles canvas methods
-   * that canvas2svg doesn't implement but PDF.js may call.
-   *
-   * A hidden shadow canvas tracks transform state so getTransform() works.
-   */
-  createSvgContextProxy(c2sCtx, width, height) {
-    // Shadow canvas to track transform state (getTransform, etc.)
-    const shadowCanvas = document.createElement('canvas');
-    shadowCanvas.width = width;
-    shadowCanvas.height = height;
-    const shadowCtx = shadowCanvas.getContext('2d');
-
-    // Transform methods that must be mirrored to the shadow canvas
-    const transformMethods = new Set([
-      'setTransform', 'resetTransform', 'transform',
-      'translate', 'rotate', 'scale',
-      'save', 'restore', 'reset',
-    ]);
-
-    const mockCanvas = {
-      width,
-      height,
-      getContext: () => c2sCtx,
-      style: {},
-      setAttribute: () => {},
-      getAttribute: () => null,
-    };
-
-    return new Proxy(c2sCtx, {
-      get(target, prop) {
-        if (prop === 'canvas') return mockCanvas;
-
-        // Delegate getTransform to the shadow canvas
-        if (prop === 'getTransform') {
-          return () => shadowCtx.getTransform();
-        }
-
-        // For transform methods, call both c2s and shadow
-        if (transformMethods.has(prop)) {
-          const c2sFn = target[prop];
-          return (...args) => {
-            if (typeof shadowCtx[prop] === 'function') {
-              shadowCtx[prop](...args);
-            }
-            if (typeof c2sFn === 'function') {
-              return c2sFn.apply(target, args);
-            }
-          };
-        }
-
-        const val = target[prop];
-        if (typeof val === 'function') {
-          return val.bind(target);
-        }
-        if (val !== undefined) {
-          return val;
-        }
-
-        // Fallbacks for methods canvas2svg doesn't have
-        if (typeof prop === 'string') {
-          if (prop === 'getImageData') {
-            return (sx, sy, sw, sh) =>
-              new ImageData(Math.max(1, Math.round(sw)), Math.max(1, Math.round(sh)));
-          }
-          if (prop === 'isPointInPath') return () => false;
-          if (prop === 'isPointInStroke') return () => false;
-          if (prop === 'measureText') {
-            return (text) => ({
-              width: text.length * 6,
-              actualBoundingBoxAscent: 10,
-              actualBoundingBoxDescent: 2,
-            });
-          }
-          // No-op for anything else
-          return () => {};
-        }
-        return undefined;
-      },
-      set(target, prop, value) {
-        try {
-          target[prop] = value;
-        } catch { /* ignore */ }
-        // Mirror writable state properties to shadow
-        try {
-          shadowCtx[prop] = value;
-        } catch { /* ignore */ }
-        return true;
-      },
-    });
-  }
+  // -------- SVG export via PDF.js SVGGraphics --------
 
   async handleDownload() {
     if (!this.selectionRect || !this.pdfDoc) return;
@@ -439,20 +344,15 @@ class PdfCropper {
 
     try {
       const page = await this.pdfDoc.getPage(this.pageNum);
-      const viewport = page.getViewport({ scale: 1.0 });
 
-      // Create canvas2svg context at full page size (PDF points)
-      const c2sCtx = new C2S(viewport.width, viewport.height);
-      const proxyCtx = this.createSvgContextProxy(c2sCtx, viewport.width, viewport.height);
+      // Get the operator list (raw PDF drawing commands)
+      const operatorList = await page.getOperatorList();
 
-      // Render the PDF page into the SVG context
-      await page.render({
-        canvasContext: proxyCtx,
-        viewport,
-      }).promise;
-
-      // Get the SVG element
-      const svgElement = c2sCtx.getSvg();
+      // Render full page to SVG using PDF.js SVGGraphics
+      const svgGraphics = new pdfjsLib.SVGGraphics(page.commonObjs, page.objs);
+      svgGraphics.embedFonts = true;
+      const pdfViewport = page.getViewport({ scale: 1.0 });
+      const svgElement = await svgGraphics.getSVG(operatorList, pdfViewport);
 
       // Convert selection from display pixels to PDF points
       const pdfX = this.selectionRect.x / this.scale;
@@ -464,27 +364,6 @@ class PdfCropper {
       svgElement.setAttribute('viewBox', `${pdfX} ${pdfY} ${pdfW} ${pdfH}`);
       svgElement.setAttribute('width', pdfW + 'pt');
       svgElement.setAttribute('height', pdfH + 'pt');
-
-      // Add a clipPath as extra safeguard
-      const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-      const clipPath = document.createElementNS('http://www.w3.org/2000/svg', 'clipPath');
-      clipPath.setAttribute('id', 'crop-clip');
-      const clipRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-      clipRect.setAttribute('x', pdfX);
-      clipRect.setAttribute('y', pdfY);
-      clipRect.setAttribute('width', pdfW);
-      clipRect.setAttribute('height', pdfH);
-      clipPath.appendChild(clipRect);
-      defs.appendChild(clipPath);
-      svgElement.insertBefore(defs, svgElement.firstChild);
-
-      // Wrap all content in a group with the clip
-      const wrapper = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-      wrapper.setAttribute('clip-path', 'url(#crop-clip)');
-      while (svgElement.childNodes.length > 1) {
-        wrapper.appendChild(svgElement.childNodes[1]);
-      }
-      svgElement.appendChild(wrapper);
 
       // Serialize
       const serializer = new XMLSerializer();
