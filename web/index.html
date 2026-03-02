@@ -1,0 +1,70 @@
+<!--
+  Copyright 2025 Google LLC
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF to SVG</title>
+  <script type="module" src="./src/app.js"></script>
+</head>
+<body>
+  <div id="drop-zone" class="drop-zone">
+    <div class="drop-zone-content">
+      <svg class="drop-icon" viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+        <line x1="12" y1="18" x2="12" y2="12"/>
+        <polyline points="9 15 12 12 15 15"/>
+      </svg>
+      <p class="drop-text">Drop a PDF here or click to browse</p>
+      <p class="drop-hint">Your file stays in the browser — nothing is uploaded</p>
+    </div>
+  </div>
+
+  <!-- File input lives outside drop zone to avoid click-event conflicts -->
+  <input type="file" id="file-input" accept="application/pdf,.pdf" hidden>
+
+  <div id="app" class="app hidden">
+    <div class="toolbar">
+      <button id="open-btn" title="Open another PDF">Open PDF</button>
+
+      <div class="toolbar-separator"></div>
+
+      <button id="prev-btn" disabled title="Previous page (Left arrow)">&larr; Prev</button>
+      <span class="page-info">
+        Page
+        <input type="number" id="page-input" min="1" value="1" title="Jump to page">
+        / <span id="page-count">--</span>
+      </span>
+      <button id="next-btn" disabled title="Next page (Right arrow)">Next &rarr;</button>
+
+      <div class="toolbar-separator"></div>
+
+      <button id="download-btn" disabled>Download Selection as SVG</button>
+      <span class="status" id="status-text">Drag to select a region</span>
+    </div>
+
+    <div id="pdf-viewport">
+      <div id="pdf-container">
+        <canvas id="pdf-canvas"></canvas>
+        <div id="selection-box"></div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

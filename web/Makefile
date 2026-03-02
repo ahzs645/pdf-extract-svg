@@ -17,11 +17,20 @@ ifeq (VERBOSE,1)
 	VERB =
 endif
 
-PORT = 8080
+PORT = 3000
 
-# Note: for security, this web server will only be accessible from the same
-# machine that is running the server. If you want to access the server from
-# another machine, remove the `--bind 127.0.0.1` flag from the command below.
-run:
-	$(VERB) echo "Starting app on: http://localhost:$(PORT)/app.html ..."
-	$(VERB) python -m http.server $(PORT) --bind 127.0.0.1
+# Install npm dependencies.
+install:
+	$(VERB) npm install
+
+# Run the Vite dev server.
+dev:
+	$(VERB) npx vite --port $(PORT)
+
+# Build for production (output in dist/).
+build:
+	$(VERB) npx vite build
+
+# Preview the production build locally.
+preview:
+	$(VERB) npx vite preview --port $(PORT)
