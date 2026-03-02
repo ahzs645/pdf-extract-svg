@@ -157,6 +157,21 @@ button:hover:not(:disabled) {
   background: var(--primary-hover);
 }
 
+.toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.toggle-label input[type="checkbox"] {
+  accent-color: var(--primary);
+}
+
 .status {
   margin-left: auto;
   font-size: 0.85rem;
@@ -168,18 +183,17 @@ button:hover:not(:disabled) {
 #pdf-viewport {
   flex: 1;
   overflow: auto;
-  display: flex;
-  justify-content: center;
   padding: 24px;
   background: var(--bg);
 }
 
 #pdf-container {
   position: relative;
-  display: inline-block;
+  display: block;
+  width: fit-content;
+  margin: 0 auto;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.12);
   cursor: crosshair;
-  flex-shrink: 0;
 }
 
 #pdf-canvas {

@@ -54,6 +54,8 @@ class PdfCropper {
     this.ctx = this.canvas.getContext('2d');
     this.container = document.getElementById('pdf-container');
     this.selectionBox = document.getElementById('selection-box');
+    this.tintToggle = document.getElementById('tint-toggle');
+    this.tintRasters = true;
 
     this.bindEvents();
   }
@@ -110,6 +112,14 @@ class PdfCropper {
       }
     });
 
+    // Tint toggle — re-render the current page when changed
+    this.tintToggle.addEventListener('change', () => {
+      this.tintRasters = this.tintToggle.checked;
+      if (this.pdfDoc) {
+        this.renderPage(this.pageNum);
+      }
+    });
+
     // Download
     this.downloadBtn.addEventListener('click', () => this.handleDownload());
 
@@ -146,7 +156,10 @@ class PdfCropper {
 
   async loadPDF(data) {
     try {
-      this.pdfDoc = await pdfjsLib.getDocument(data).promise;
+      this.pdfDoc = await pdfjsLib.getDocument({
+        data,
+        fontExtraProperties: true,
+      }).promise;
       this.pageNum = 1;
 
       // Show the app, hide drop zone
@@ -178,7 +191,36 @@ class PdfCropper {
       this.canvas.width = viewport.width;
       this.canvas.height = viewport.height;
 
+      // Wrap drawImage to tint raster images so the user can see what
+      // won't export as vector SVG.
+      const origDrawImage = this.ctx.drawImage.bind(this.ctx);
+      this.ctx.drawImage = (...args) => {
+        origDrawImage(...args);
+
+        // Determine the destination rectangle
+        let dx, dy, dw, dh;
+        if (args.length === 3) {
+          [, dx, dy] = args;
+          dw = args[0].width;
+          dh = args[0].height;
+        } else if (args.length === 5) {
+          [, dx, dy, dw, dh] = args;
+        } else if (args.length === 9) {
+          [, , , , , dx, dy, dw, dh] = args;
+        }
+
+        if (dw && dh) {
+          this.ctx.save();
+          this.ctx.fillStyle = 'rgba(255, 140, 0, 0.25)';
+          this.ctx.fillRect(dx, dy, dw, dh);
+          this.ctx.restore();
+        }
+      };
+
       await page.render({ canvasContext: this.ctx, viewport }).promise;
+
+      // Restore original drawImage
+      this.ctx.drawImage = origDrawImage;
 
       this.pageRendering = false;
       this.pageInput.value = num;
@@ -335,6 +377,29 @@ class PdfCropper {
 
   // -------- SVG export via PDF.js SVGGraphics --------
 
+  /**
+   * Patches SVGGraphics image methods so that undecodable images (e.g. JPEG2000
+   * without the WASM decoder) are silently skipped instead of crashing.
+   */
+  patchSvgGraphics(svgGfx) {
+    const wrap = (name) => {
+      const original = svgGfx[name];
+      if (typeof original !== 'function') return;
+      svgGfx[name] = function (...args) {
+        try {
+          return original.apply(this, args);
+        } catch (err) {
+          console.warn(`SVGGraphics.${name} skipped:`, err.message);
+        }
+      };
+    };
+    wrap('paintImageXObject');
+    wrap('paintInlineImageXObject');
+    wrap('paintImageMaskXObject');
+    wrap('addFontStyle');
+    wrap('setFont');
+  }
+
   async handleDownload() {
     if (!this.selectionRect || !this.pdfDoc) return;
 
@@ -351,6 +416,7 @@ class PdfCropper {
       // Render full page to SVG using PDF.js SVGGraphics
       const svgGraphics = new pdfjsLib.SVGGraphics(page.commonObjs, page.objs);
       svgGraphics.embedFonts = true;
+      this.patchSvgGraphics(svgGraphics);
       const pdfViewport = page.getViewport({ scale: 1.0 });
       const svgElement = await svgGraphics.getSVG(operatorList, pdfViewport);
 
