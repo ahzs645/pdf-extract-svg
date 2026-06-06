@@ -16,3 +16,4 @@ node_modules/
 
 # Vite build output
 web/dist/
+.DS_Store
