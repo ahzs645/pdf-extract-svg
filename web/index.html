@@ -55,20 +55,109 @@
 
       <div class="toolbar-separator"></div>
 
-      <button id="download-btn" disabled>Download Selection as SVG</button>
+      <div class="mode-switch" title="How clicking and dragging selects">
+        <button id="region-mode-btn" class="mode-btn active" title="Drag a rectangle; click an image to grab it">Region</button>
+        <button id="object-mode-btn" class="mode-btn" title="Click individual objects on the page">Object</button>
+      </div>
+
+      <div class="toolbar-separator"></div>
+
+      <div class="zoom-controls" title="Pinch to zoom, or Ctrl/Cmd + scroll">
+        <button id="zoom-out-btn" class="icon-btn" title="Zoom out (Ctrl/Cmd -)">&minus;</button>
+        <button id="zoom-reset-btn" class="zoom-level" title="Reset zoom (Ctrl/Cmd 0)">150%</button>
+        <button id="zoom-in-btn" class="icon-btn" title="Zoom in (Ctrl/Cmd +)">+</button>
+      </div>
+
+      <div class="toolbar-separator"></div>
+
+      <button id="download-btn" disabled>Download Selection</button>
+      <button id="edit-btn" disabled title="Open the selection in the vector editor">Edit vectors</button>
+
+      <label class="toggle-label" title="Export text as outlines. Larger, but renders identically without the original fonts.">
+        <input type="checkbox" id="text-mode-toggle">
+        Text as outlines
+      </label>
+
+      <label class="toggle-label" title="Outline images found on the page; click one to select it">
+        <input type="checkbox" id="images-toggle" checked>
+        Detect images
+      </label>
 
       <label class="toggle-label" title="Tint raster images that won't export as vector SVG">
-        <input type="checkbox" id="tint-toggle" checked>
+        <input type="checkbox" id="tint-toggle">
         Highlight rasters
       </label>
 
       <span class="status" id="status-text">Drag to select a region</span>
     </div>
 
-    <div id="pdf-viewport">
-      <div id="pdf-container">
-        <canvas id="pdf-canvas"></canvas>
-        <div id="selection-box"></div>
+    <div class="workspace">
+      <div id="pdf-viewport">
+        <div id="pdf-container">
+          <canvas id="pdf-canvas"></canvas>
+          <div id="image-layer"></div>
+          <div id="object-layer" class="hidden"></div>
+          <div id="selection-layer"></div>
+          <div id="selection-box"></div>
+        </div>
+      </div>
+
+      <aside id="library" class="library">
+        <div class="library-header">
+          <h2>Library <span id="library-count" class="badge">0</span></h2>
+          <div class="library-header-actions">
+            <button id="export-all-btn" class="small-btn" disabled title="Download every selection as one zip">Export all</button>
+            <button id="clear-all-btn" class="small-btn secondary" disabled title="Remove every selection">Clear</button>
+          </div>
+        </div>
+        <p id="library-empty" class="library-hint">
+          Drag a region on the page to add it here. Each entry previews the
+          actual SVG that will be exported.
+        </p>
+        <div id="library-list" class="library-list"></div>
+
+        <section id="objects-panel" class="objects-panel hidden">
+          <div class="objects-header">
+            <h3>Objects <span id="objects-count" class="badge">0</span></h3>
+            <div class="library-header-actions">
+              <button id="drop-rasters-btn" class="small-btn secondary" disabled title="Hide every raster image, leaving only what scales losslessly">Drop rasters</button>
+              <button id="show-all-btn" class="small-btn secondary" disabled title="Un-hide every object in this selection">Show all</button>
+            </div>
+          </div>
+          <p id="objects-summary" class="objects-summary"></p>
+          <div id="objects-list" class="objects-list"></div>
+        </section>
+      </aside>
+    </div>
+  </div>
+
+  <div id="editor-overlay" class="editor-overlay hidden">
+    <div class="editor-shell">
+      <header class="editor-header">
+        <div>
+          <h2>Vector editor</h2>
+          <p id="editor-title" class="editor-subtitle"></p>
+        </div>
+        <div class="editor-actions">
+          <button id="editor-delete-btn" class="small-btn secondary" disabled title="Delete the selected shape (Delete)">Delete shape</button>
+          <button id="editor-undo-btn" class="small-btn secondary" disabled title="Undo the last delete (Ctrl/Cmd Z)">Undo</button>
+          <button id="editor-cancel-btn" class="small-btn secondary" title="Discard these edits (Esc)">Cancel</button>
+          <button id="editor-done-btn" class="small-btn" title="Apply these edits to the selection">Done</button>
+        </div>
+      </header>
+      <div class="editor-body">
+        <div id="editor-stage" class="editor-stage"></div>
+        <aside class="editor-layers">
+          <div class="editor-layers-header">
+            <h3>Layers</h3>
+            <span id="editor-count" class="editor-subtitle"></span>
+          </div>
+          <label class="toggle-label editor-filter" title="MuPDF writes the whole page; hide everything that falls outside this crop">
+            <input type="checkbox" id="editor-inview-toggle" checked>
+            Only shapes in the crop
+          </label>
+          <div id="editor-list" class="editor-list"></div>
+        </aside>
       </div>
     </div>
   </div>

@@ -24,6 +24,15 @@
   --primary-hover: #1d4ed8;
   --selection-border: #2563eb;
   --selection-fill: rgba(37, 99, 235, 0.12);
+  --selection-active: #d97706;
+  --selection-active-fill: rgba(217, 119, 6, 0.16);
+  --image-outline: rgba(13, 148, 136, 0.55);
+  --image-fill: rgba(13, 148, 136, 0.06);
+  --image-outline-hot: #0d9488;
+  --object-outline: rgba(107, 114, 128, 0.35);
+  --object-hot: #2563eb;
+  --object-hot-fill: rgba(37, 99, 235, 0.14);
+  --image-fill-hot: rgba(13, 148, 136, 0.18);
 }
 
 * {
@@ -172,6 +181,33 @@ button:hover:not(:disabled) {
   accent-color: var(--primary);
 }
 
+.zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.icon-btn {
+  padding: 4px 0;
+  width: 26px;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.zoom-level {
+  min-width: 56px;
+  padding: 5px 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+}
+
+.zoom-level:hover:not(:disabled) {
+  background: rgba(37, 99, 235, 0.08);
+  color: var(--text);
+}
+
 .status {
   margin-left: auto;
   font-size: 0.85rem;
@@ -180,11 +216,20 @@ button:hover:not(:disabled) {
 
 /* ---------- PDF viewport ---------- */
 
+.workspace {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
 #pdf-viewport {
   flex: 1;
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 24px;
   background: var(--bg);
+  /* A drag may start out here, in the margin around the page. */
+  cursor: crosshair;
 }
 
 #pdf-container {
@@ -194,10 +239,34 @@ button:hover:not(:disabled) {
   margin: 0 auto;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.12);
   cursor: crosshair;
+  /* Handle two-finger pinch ourselves rather than letting the browser zoom. */
+  touch-action: none;
 }
 
 #pdf-canvas {
   display: block;
+}
+
+#selection-layer,
+#image-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* Images found on the page. Hit testing happens in JS, so these are purely
+   visual and never swallow a drag that starts on top of one. */
+.image-hotspot {
+  position: absolute;
+  border: 1px dashed var(--image-outline);
+  background: var(--image-fill);
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.image-hotspot.hot {
+  border-style: solid;
+  border-color: var(--image-outline-hot);
+  background: var(--image-fill-hot);
 }
 
 /* ---------- Selection rectangle ---------- */
@@ -208,6 +277,363 @@ button:hover:not(:disabled) {
   background-color: var(--selection-fill);
   display: none;
   pointer-events: none;
+}
+
+.selection-rect {
+  position: absolute;
+  border: 2px solid var(--selection-border);
+  background-color: var(--selection-fill);
+  pointer-events: none;
+}
+
+.selection-rect.active {
+  border-color: var(--selection-active);
+  background-color: var(--selection-active-fill);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6);
+}
+
+.selection-tag {
+  position: absolute;
+  top: -2px;
+  left: -2px;
+  min-width: 18px;
+  padding: 1px 5px;
+  background: var(--selection-border);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.selection-rect.active .selection-tag {
+  background: var(--selection-active);
+}
+
+/* ---------- Mode switch ---------- */
+
+.mode-switch {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.mode-btn {
+  padding: 5px 12px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.mode-btn:hover:not(:disabled) {
+  background: rgba(37, 99, 235, 0.08);
+  color: var(--text);
+}
+
+.mode-btn.active {
+  background: var(--primary);
+  color: #fff;
+}
+
+/* ---------- Object outlines ---------- */
+
+#object-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.object-outline {
+  position: absolute;
+  border: 1px solid var(--object-outline);
+  background: transparent;
+}
+
+.object-outline.hot {
+  border-color: var(--object-hot);
+  background: var(--object-hot-fill);
+}
+
+.object-outline.chosen {
+  border-color: var(--selection-active);
+  background: var(--selection-active-fill);
+}
+
+.object-outline.object-hidden {
+  border-style: dotted;
+  opacity: 0.4;
+}
+
+/* ---------- Objects panel ---------- */
+
+.objects-panel {
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  max-height: 45%;
+}
+
+.objects-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+}
+
+.objects-header h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.objects-summary {
+  padding: 0 14px 8px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.objects-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 8px 8px;
+}
+
+.object-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  cursor: default;
+}
+
+.object-row:hover {
+  background: var(--bg);
+}
+
+.object-row.is-hidden .object-label,
+.object-row.is-hidden .object-kind {
+  opacity: 0.45;
+  text-decoration: line-through;
+}
+
+.eye-btn {
+  padding: 0;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  background: none;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  line-height: 1;
+}
+
+.eye-btn:hover:not(:disabled) {
+  background: none;
+  color: var(--primary);
+}
+
+.object-kind {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: 0.68rem;
+}
+
+.kind-text { background: rgba(37, 99, 235, 0.12); color: #1d4ed8; }
+.kind-image { background: rgba(13, 148, 136, 0.14); color: #0f766e; }
+.kind-vector { background: rgba(217, 119, 6, 0.14); color: #b45309; }
+
+.object-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- Library ---------- */
+
+.library {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.library-header {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.library-header h2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.badge {
+  display: inline-block;
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-align: center;
+}
+
+.library-header-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.small-btn {
+  padding: 4px 10px;
+  font-size: 0.78rem;
+}
+
+.small-btn.secondary {
+  background: var(--bg);
+  color: var(--text-muted);
+}
+
+.small-btn.secondary:hover:not(:disabled) {
+  background: var(--border);
+  color: var(--text);
+}
+
+.library-hint {
+  padding: 16px 14px;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.library-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.library-item {
+  display: flex;
+  gap: 10px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.library-item:hover {
+  background: var(--bg);
+}
+
+.library-item.active {
+  border-color: var(--selection-active);
+  background: rgba(217, 119, 6, 0.06);
+}
+
+.library-thumb {
+  width: 72px;
+  height: 72px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+  background-image:
+    linear-gradient(45deg, #f0f0f0 25%, transparent 25%),
+    linear-gradient(-45deg, #f0f0f0 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #f0f0f0 75%),
+    linear-gradient(-45deg, transparent 75%, #f0f0f0 75%);
+  background-size: 12px 12px;
+  background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+  overflow: hidden;
+}
+
+.library-thumb img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.thumb-pending,
+.thumb-error {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-align: center;
+  background-image: none;
+}
+
+.thumb-error {
+  color: #b91c1c;
+}
+
+.library-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.library-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.library-dims {
+  font-size: 0.73rem;
+  color: var(--text-muted);
+}
+
+.library-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: auto;
+}
+
+.link-btn {
+  padding: 2px 0;
+  background: none;
+  color: var(--primary);
+  font-size: 0.76rem;
+  font-weight: 500;
+}
+
+.link-btn:hover:not(:disabled) {
+  background: none;
+  text-decoration: underline;
+}
+
+.link-btn:disabled {
+  background: none;
+  color: var(--text-muted);
+}
+
+.link-btn.danger {
+  color: #b91c1c;
 }
 
 /* ---------- Responsive ---------- */
@@ -225,4 +651,180 @@ button:hover:not(:disabled) {
   .drop-zone-content {
     padding: 40px 24px;
   }
+
+  .workspace {
+    flex-direction: column;
+  }
+
+  .library {
+    width: auto;
+    max-height: 40vh;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+}
+
+/* ---------- Vector editor ---------- */
+
+.editor-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(17, 24, 39, 0.55);
+}
+
+.editor-shell {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  max-width: 1400px;
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+}
+
+.editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.editor-header h2 {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.editor-subtitle {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.editor-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.editor-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+/* The artwork sits on a checkerboard so transparent areas read as transparent. */
+.editor-stage {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  min-width: 0;
+  background-color: #fff;
+  background-image:
+    linear-gradient(45deg, #eef0f3 25%, transparent 25%),
+    linear-gradient(-45deg, #eef0f3 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #eef0f3 75%),
+    linear-gradient(-45deg, transparent 75%, #eef0f3 75%);
+  background-size: 20px 20px;
+  background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+}
+
+.editor-svg {
+  max-width: 100%;
+  max-height: 100%;
+  filter: drop-shadow(0 2px 10px rgba(0, 0, 0, 0.12));
+}
+
+/* Make every shape a click target, including unfilled ones. */
+.editor-svg [data-el-id] {
+  pointer-events: all;
+  cursor: pointer;
+}
+
+.editor-svg [data-el-id].is-hot {
+  outline: 1px dashed var(--primary);
+}
+
+.editor-svg [data-el-id].is-selected {
+  outline: 2px solid var(--selection-active);
+  outline-offset: 1px;
+}
+
+.editor-layers {
+  width: 320px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.editor-layers-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.editor-layers-header h3 {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.editor-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.editor-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.editor-row:hover {
+  background: var(--bg);
+}
+
+.editor-row.active {
+  background: rgba(217, 119, 6, 0.12);
+  box-shadow: inset 2px 0 0 var(--selection-active);
+}
+
+.editor-row.is-deleted .object-label,
+.editor-row.is-deleted .object-kind {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+
+@media (max-width: 860px) {
+  .editor-body {
+    flex-direction: column;
+  }
+
+  .editor-layers {
+    width: auto;
+    max-height: 45%;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+}
+
+.editor-filter {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
 }
