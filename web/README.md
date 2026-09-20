@@ -38,10 +38,22 @@ the browser — no files are uploaded to any server.
 8. **Export** — A region exports as SVG written by
    [MuPDF](https://mupdf.com/) via its WebAssembly build. MuPDF writes the page
    with the SVG viewport set to the selection, and the content translated so the
-   selection lands on it; [SVGO](https://svgo.dev/) then prunes what falls
-   outside and compresses the rest. An image grabbed by clicking it exports as a
-   PNG at the image's own pixel dimensions instead, since wrapping a raster in
-   SVG gains nothing.
+   selection lands on it. Everything else on the page comes along, clipped only
+   by that viewport, so each element is measured against the crop and dropped if
+   it misses; [SVGO](https://svgo.dev/) then compresses what is left. An image
+   grabbed by clicking it exports as a PNG at the image's own pixel dimensions
+   instead, since wrapping a raster in SVG gains nothing.
+9. **Fonts** — MuPDF names the font behind each text run but cannot embed it,
+   and a subset name like `NNFDFE+Arial` matches nothing on any machine, so
+   text alone exports in whatever face the viewer falls back to. PDF.js has
+   already parsed and repaired every font on the page for its own rendering, so
+   each family in the SVG is matched back to the PDF font it came from and
+   written in as an `@font-face` rule. The text stays text — selectable,
+   searchable, editable — and renders in the typeface it was set in. Fonts
+   PDF.js maps through a private-use area get a Unicode `cmap` first, so the
+   characters the SVG spells out reach the right glyphs. What cannot be
+   embedded, such as a font the PDF never carried, falls back to the real
+   typeface name with the subset tag stripped.
 
 ## Why PDF.js is held at 4.x
 

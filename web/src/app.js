@@ -16,6 +16,7 @@ import './app.css';
 import * as pdfjsLib from 'pdfjs-dist';
 import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker';
 import { optimize as svgOptimize } from 'svgo/browser';
+import { buildFontCss, usageKey } from './fonts.js';
 import { zip as zipAsync } from 'fflate';
 
 // PDF.js ships an ES-module worker from v4 on. Letting Vite construct it as a
@@ -44,6 +45,7 @@ function mulMatrix(m1, m2) {
 function applyMatrix(x, y, m) {
   return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
 }
+const SVG_NS = 'http://www.w3.org/2000/svg';
 const OBJ_ATTR = 'data-obj-id';
 const EDIT_ATTR = 'data-el-id';
 const DRAWABLE_SELECTOR =
@@ -84,6 +86,9 @@ class PdfCropper {
     // Cache of full-page SVG renders, keyed by page number, so that several
     // selections on one page don't each re-render the page.
     this.pageSvgCache = new Map();
+
+    // Cache of the fonts PDF.js parsed for a page, keyed by page number.
+    this.pageFontCache = new Map();
 
     // MuPDF is the SVG export engine, loaded on first export.
     this.pdfBytes = null;
@@ -388,6 +393,9 @@ class PdfCropper {
         // Decode images to plain typed arrays rather than ImageBitmaps, which
         // is what the native-format PNG extraction reads.
         isOffscreenCanvasSupported: false,
+        // Keep the character-code tables alongside each parsed font. SVG
+        // export needs them to give an embedded font a Unicode cmap.
+        fontExtraProperties: true,
         // NOTE: pdfjs-dist is held at 4.x deliberately. From 5.0 on, CCITT
         // stencil image masks stop rendering -- monocult.pdf loses both of its
         // cover illustrations. 4.10.38 is the newest release that draws them,
@@ -396,6 +404,7 @@ class PdfCropper {
       this.pageNum = 1;
       this.clearLibrary();
       this.pageSvgCache.clear();
+      this.pageFontCache.clear();
       this.imageCache.clear();
       this.pageImages = [];
       this.objectCache.clear();
@@ -1665,17 +1674,23 @@ class PdfCropper {
   }
 
   /**
-   * Drops embedded rasters that fall entirely outside the crop. PDF.js renders
-   * the whole page, and with data: URIs every image on the page would other-
-   * wise ride along in each crop as a base64 payload.
+   * Drops content that falls entirely outside the crop. MuPDF writes the whole
+   * page and lets the viewport do the cropping, so without this every crop
+   * carries the rest of the page: each image as a base64 payload, every line
+   * of text as a run that pulls its font in with it, and, with text as
+   * outlines, every glyph on the page as a path. SVGO's own off-canvas pass
+   * gives up on anything carrying a transform, which is all of it.
    *
    * Geometry is compared in screen space, which is the one coordinate system
    * both the root's viewBox mapping and each element's transform chain agree
    * on. The element must be in the document for the browser to resolve those.
+   * Only content that misses the crop outright goes: a stroke can paint well
+   * outside its own geometry, so the box grows by the stroke before the test,
+   * and anything that cannot be measured stays.
    */
-  pruneOffCanvasImages(svgElement, crop) {
-    const images = svgElement.querySelectorAll('image');
-    if (!images.length) return 0;
+  pruneOffCanvas(svgElement, crop, selector = 'image, text, path, use') {
+    const candidates = svgElement.querySelectorAll(selector);
+    if (!candidates.length) return 0;
 
     const holder = document.createElement('div');
     holder.style.cssText =
@@ -1701,17 +1716,30 @@ class PdfCropper {
         y0: Math.min(c0.y, c1.y), y1: Math.max(c0.y, c1.y),
       };
 
-      for (const el of [...images]) {
+      for (const el of [...candidates]) {
+        // Definitions are referenced from elsewhere, so where they sit says
+        // nothing about where they paint.
+        if (el.closest('defs, clipPath, mask, pattern, marker, symbol')) continue;
+
         let box;
         try {
           const bbox = el.getBBox();
           const ctm = el.getScreenCTM();
           if (!ctm || !bbox.width || !bbox.height) continue;
+          // A stroke is centred on the path, so it reaches half its width
+          // past the geometry on every side. Both properties inherit, so the
+          // value that applies may sit on an ancestor.
+          const stroke = el.closest('[stroke]')?.getAttribute('stroke');
+          const width = parseFloat(
+            el.closest('[stroke-width]')?.getAttribute('stroke-width') ?? '1');
+          const pad = stroke && stroke !== 'none'
+            ? (Number.isFinite(width) ? width : 1) / 2
+            : 0;
           const pts = [
-            toScreen(ctm, bbox.x, bbox.y),
-            toScreen(ctm, bbox.x + bbox.width, bbox.y),
-            toScreen(ctm, bbox.x, bbox.y + bbox.height),
-            toScreen(ctm, bbox.x + bbox.width, bbox.y + bbox.height),
+            toScreen(ctm, bbox.x - pad, bbox.y - pad),
+            toScreen(ctm, bbox.x + bbox.width + pad, bbox.y - pad),
+            toScreen(ctm, bbox.x - pad, bbox.y + bbox.height + pad),
+            toScreen(ctm, bbox.x + bbox.width + pad, bbox.y + bbox.height + pad),
           ];
           const xs = pts.map((p) => p.x);
           const ys = pts.map((p) => p.y);
@@ -1731,10 +1759,134 @@ class PdfCropper {
           removed++;
         }
       }
+      if (removed) removed += this.pruneUnusedDefs(svgElement);
     } finally {
       holder.remove();
     }
     return removed;
+  }
+
+  /**
+   * Drops definitions nothing refers to any more. With text as outlines MuPDF
+   * defines every glyph on the page once and draws it with <use>, so pruning
+   * the draws leaves the shapes behind unless they go too.
+   */
+  pruneUnusedDefs(svgElement) {
+    const defs = [...svgElement.querySelectorAll('defs > *')].filter((el) => el.id);
+    if (!defs.length) return 0;
+
+    // Every way one element can name another: url(#id) in a presentation
+    // attribute or a style declaration, and a plain #id in href.
+    const referenced = new Set();
+    for (const el of svgElement.querySelectorAll('*')) {
+      for (const { value } of el.attributes) {
+        for (const m of value.matchAll(/url\(\s*['"]?#([^)'"\s]+)/g)) {
+          referenced.add(m[1]);
+        }
+        if (value.startsWith('#')) referenced.add(value.slice(1));
+      }
+    }
+
+    let removed = 0;
+    for (const el of defs) {
+      // A definition can be referenced by another definition.
+      if (referenced.has(el.id)) continue;
+      el.remove();
+      removed++;
+    }
+    return removed;
+  }
+
+  /**
+   * The fonts PDF.js parsed for a page, as font objects carrying the repaired
+   * OpenType program plus the character-code tables that go with it.
+   *
+   * PDF.js builds these to render the page and hands them over the worker
+   * boundary; asking for the operator list is what makes them arrive, and it
+   * is cached, so a page already on screen costs nothing here.
+   */
+  getPageFonts(pageNum) {
+    if (!this.pageFontCache.has(pageNum)) {
+      const job = (async () => {
+        const page = await this.pdfDoc.getPage(pageNum);
+        const ops = await page.getOperatorList();
+        const names = new Set();
+        ops.fnArray.forEach((fn, i) => {
+          if (fn === pdfjsLib.OPS.setFont) names.add(ops.argsArray[i][0]);
+        });
+
+        const fonts = [];
+        for (const name of names) {
+          if (!page.commonObjs.has(name)) continue;
+          const font = page.commonObjs.get(name);
+          // Type 3 fonts are drawing procedures, not font programs.
+          if (font && !font.isType3Font) fonts.push(font);
+        }
+        return fonts;
+      })().catch((err) => {
+        console.warn(`Could not read the fonts on page ${pageNum}:`, err);
+        return [];
+      });
+      this.pageFontCache.set(pageNum, job);
+    }
+    return this.pageFontCache.get(pageNum);
+  }
+
+  /**
+   * Carries the PDF's fonts into the SVG.
+   *
+   * MuPDF names the font each text run was drawn with but cannot embed it, and
+   * a subset name like `NNFDFE+Arial` matches nothing anywhere, so on its own
+   * the export falls back to whatever the viewer feels like. Matching those
+   * names back to the page's fonts and writing them in as `@font-face` rules
+   * makes the text render in the typeface it was set in, while staying text
+   * that can be selected, searched and edited.
+   */
+  async embedFonts(root, pageNum) {
+    const texts = [...root.querySelectorAll('text')];
+    if (!texts.length) return 0;
+
+    // The family an element asks for, reading past a stack this may have
+    // already been run on.
+    const askedFor = (el) => {
+      const family = (el.getAttribute('font-family') || '')
+        .split(',')[0].trim().replace(/^['"]|['"]$/g, '');
+      if (!family) return null;
+      return {
+        family,
+        bold: /bold|^[6-9]00$/.test(el.getAttribute('font-weight') || ''),
+        italic: /italic|oblique/.test(el.getAttribute('font-style') || ''),
+      };
+    };
+
+    const usages = new Map();
+    for (const el of texts) {
+      const usage = askedFor(el);
+      if (!usage) continue;
+      const seen = usages.get(usageKey(usage));
+      // What a run spells out is what identifies its font when the name does
+      // not; a few hundred characters are plenty to tell the fonts apart.
+      if (!seen) usages.set(usageKey(usage), { ...usage, text: el.textContent });
+      else if (seen.text.length < 2000) seen.text += el.textContent;
+    }
+    if (!usages.size) return 0;
+
+    const fonts = await this.getPageFonts(pageNum);
+    if (!fonts.length) return 0;
+
+    const { css, stacks, embedded } = buildFontCss([...usages.values()], fonts);
+    for (const el of texts) {
+      const usage = askedFor(el);
+      const stack = usage && stacks.get(usageKey(usage));
+      if (stack) el.setAttribute('font-family', stack);
+    }
+
+    if (css) {
+      const style = root.ownerDocument.createElementNS(SVG_NS, 'style');
+      style.textContent = css;
+      root.insertBefore(style, root.firstChild);
+    }
+    return embedded;
   }
 
   /** Builds the SVG string for one selection, cropped and optimized. */
@@ -1780,8 +1932,16 @@ class PdfCropper {
       root.setAttribute('viewBox', `${sel.x} ${sel.y} ${sel.w} ${sel.h}`);
       root.setAttribute('width', sel.w + 'pt');
       root.setAttribute('height', sel.h + 'pt');
-      this.pruneOffCanvasImages(root, sel);
     }
+
+    // A MuPDF crop draws in its own coordinates, a windowed page render in the
+    // page's; the viewBox is what says which, and is the crop either way.
+    const viewBox = (root.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
+    const crop = viewBox.length === 4 && viewBox.every(Number.isFinite)
+      ? { x: viewBox[0], y: viewBox[1], w: viewBox[2], h: viewBox[3] }
+      : sel;
+    this.pruneOffCanvas(root, crop);
+    await this.embedFonts(root, sel.page);
 
     // Tag in document order. Generation is deterministic for a given page,
     // box and text mode, so these ids are stable across rebuilds.
@@ -1805,7 +1965,22 @@ class PdfCropper {
     let svgString = new XMLSerializer().serializeToString(root);
     try {
       svgString = svgOptimize(svgString, {
-        plugins: ['preset-default', 'removeOffCanvasPaths'],
+        plugins: [
+          {
+            name: 'preset-default',
+            params: {
+              overrides: {
+                // The @font-face rules carry the embedded fonts. Inlining
+                // turns rules into presentation attributes, which an at-rule
+                // cannot become, and minifying re-parses a megabyte of base64
+                // for nothing.
+                inlineStyles: false,
+                minifyStyles: false,
+              },
+            },
+          },
+          'removeOffCanvasPaths',
+        ],
       }).data;
     } catch (svgoErr) {
       console.warn('SVGO optimization failed, using raw SVG:', svgoErr);
