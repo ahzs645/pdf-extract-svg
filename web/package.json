@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test test/document-session.test.js test/preview-store.test.js",
+    "test": "node --test test/document-session.test.js test/preview-store.test.js test/export-size.test.js",
     "test:browser": "node --test test/browser.test.js",
     "test:production": "npm run build && BROWSER_TEST_MODE=production npm run test:browser"
   },

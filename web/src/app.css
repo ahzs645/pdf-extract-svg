@@ -535,6 +535,7 @@ button:hover:not(:disabled) {
 
 .library-item {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 8px;
   border: 1px solid var(--border);
@@ -612,6 +613,63 @@ button:hover:not(:disabled) {
   display: flex;
   gap: 8px;
   margin-top: auto;
+}
+
+.size-breakdown {
+  flex-basis: 100%;
+  min-width: 0;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+  font-size: 0.73rem;
+  cursor: default;
+}
+
+.size-breakdown summary {
+  color: var(--primary);
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.size-table {
+  width: 100%;
+  margin-top: 8px;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.size-table caption {
+  text-align: left;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+.size-table th,
+.size-table td {
+  padding: 3px 2px;
+  text-align: right;
+  font-weight: normal;
+}
+
+.size-table th:first-child {
+  text-align: left;
+}
+
+.size-table thead th {
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.size-note {
+  margin-top: 6px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.size-images {
+  list-style: none;
+  margin-top: 6px;
+  padding: 0;
+  line-height: 1.5;
 }
 
 .link-btn {

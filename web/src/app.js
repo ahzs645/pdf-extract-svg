@@ -20,6 +20,7 @@ import { RasterExporter } from './raster-export.js';
 import { SvgExporter } from './svg-export.js';
 import { PreviewStore } from './preview-store.js';
 import { EDIT_ATTR } from './geometry.js';
+import { analyzeSvgSize, analyzeRasterSize, formatBytes } from './export-size.js';
 import { zip as zipAsync } from 'fflate';
 
 const DEFAULT_SCALE = 1.5;
@@ -1275,11 +1276,11 @@ export class PdfCropper {
     if (sel.source === 'image') {
       const raster = await rasterExporter.buildRaster(sel);
       return { blob: raster.blob, format: 'png',
-        pixelWidth: raster.width, pixelHeight: raster.height };
+        pixelWidth: raster.width, pixelHeight: raster.height, sizeBreakdown: null };
     }
     const svgString = await svgExporter.buildSvg(sel);
     return { blob: new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' }),
-      format: 'svg', svgString, pixelWidth: undefined, pixelHeight: undefined };
+      format: 'svg', svgString, pixelWidth: undefined, pixelHeight: undefined, sizeBreakdown: null };
   }
 
   buildPreview(sel) {
@@ -1646,10 +1647,90 @@ export class PdfCropper {
   // -------- Library panel --------
 
   formatSize(bytes) {
-    if (bytes === undefined) return '';
-    return bytes < 1024
-      ? `${bytes} B`
-      : `${(bytes / 1024).toFixed(bytes < 1024 * 100 ? 1 : 0)} KB`;
+    return formatBytes(bytes);
+  }
+
+  renderSizeBreakdown(sel) {
+    const details = document.createElement('details');
+    details.className = 'size-breakdown';
+    details.open = !!sel.showSizeBreakdown;
+    const summary = document.createElement('summary');
+    summary.textContent = 'Size breakdown';
+    summary.addEventListener('click', () => {
+      sel.showSizeBreakdown = !details.open;
+    });
+    details.appendChild(summary);
+    // Opening this control should not select the card or rebuild the Library.
+    details.addEventListener('click', (event) => event.stopPropagation());
+
+    const populate = () => {
+      if (details.children.length > 1) return;
+      // Analyze only when requested, and reuse it until the export changes.
+      sel.sizeBreakdown ||= sel.format === 'svg'
+        ? analyzeSvgSize(sel.svgString) : analyzeRasterSize(sel.blob);
+      const { categories, totalBytes, images } = sel.sizeBreakdown;
+      const table = document.createElement('table');
+      table.className = 'size-table';
+      const caption = document.createElement('caption');
+      caption.textContent = `Export size: ${formatBytes(totalBytes)}`;
+      table.appendChild(caption);
+      const head = document.createElement('thead');
+      const header = document.createElement('tr');
+      for (const label of ['Type', 'Size', 'Share']) {
+        const cell = document.createElement('th');
+        cell.scope = 'col';
+        cell.textContent = label;
+        header.appendChild(cell);
+      }
+      head.appendChild(header);
+      table.appendChild(head);
+      const body = document.createElement('tbody');
+      for (const group of categories) {
+        const row = document.createElement('tr');
+        row.dataset.sizeType = group.id;
+        const label = document.createElement('th');
+        label.scope = 'row';
+        label.textContent = group.label;
+        const size = document.createElement('td');
+        size.textContent = formatBytes(group.bytes);
+        const share = document.createElement('td');
+        share.textContent = `${totalBytes ? (100 * group.bytes / totalBytes).toFixed(1) : '0.0'}%`;
+        row.append(label, size, share);
+        body.appendChild(row);
+      }
+      table.appendChild(body);
+      details.appendChild(table);
+      const counts = document.createElement('p');
+      counts.className = 'size-note';
+      counts.textContent = categories.filter((group) => group.count > 0)
+        .map((group) => `${group.count.toLocaleString()} ${
+          { vectors: 'shapes', images: 'images', text: 'text runs', fonts: 'font rules' }[group.id] || group.label
+        }`).join(' · ');
+      details.appendChild(counts);
+      if (images.length) {
+        const list = document.createElement('ul');
+        list.className = 'size-images';
+        images.forEach((image, index) => {
+          const item = document.createElement('li');
+          item.textContent = `${index + 1}. ${image.type}: ${formatBytes(image.bytes)}`;
+          list.appendChild(item);
+        });
+        details.appendChild(list);
+      }
+      const note = document.createElement('p');
+      note.className = 'size-note';
+      note.textContent = sel.format === 'svg'
+        ? 'Includes embedded data and content hidden by clipping. Text outlines count as vectors.'
+        : 'Size of the complete PNG file.';
+      details.appendChild(note);
+    };
+    details.addEventListener('toggle', () => {
+      if (!details.isConnected) return;
+      sel.showSizeBreakdown = details.open;
+      if (details.open) populate();
+    });
+    if (details.open) populate();
+    return details;
   }
 
   renderLibrary() {
@@ -1744,6 +1825,7 @@ export class PdfCropper {
 
       item.appendChild(thumb);
       item.appendChild(meta);
+      if (sel.previewState === 'ready') item.appendChild(this.renderSizeBreakdown(sel));
       this.libraryList.appendChild(item);
     });
   }

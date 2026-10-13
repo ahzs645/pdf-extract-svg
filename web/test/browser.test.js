@@ -533,6 +533,82 @@ test('zoom and raster highlighting preserve the native export', async (t) => {
   );
 });
 
+test('size breakdown opens on demand, reports SVG and image types, and refreshes after edits', async (t) => {
+  const page = await app(t);
+  await page.evaluate(() =>
+    testCropper.addSelection({ page: 1, x: 10, y: 10, w: 180, h: 170 })
+  );
+  await page.waitForFunction(
+    () => testCropper.selections[0].previewState === 'ready'
+  );
+  assert.equal(
+    await page.evaluate(() => testCropper.selections[0].sizeBreakdown),
+    null,
+    'Analysis should be deferred until requested'
+  );
+  await page.locator('.size-breakdown summary').click();
+  await page.waitForFunction(() => !!testCropper.selections[0].sizeBreakdown);
+  const report = await page.evaluate(() => ({
+    report: testCropper.selections[0].sizeBreakdown,
+    blobSize: testCropper.selections[0].blob.size,
+    id: testCropper.activeId,
+  }));
+  assert.equal(report.report.totalBytes, report.blobSize);
+  assert.equal(
+    report.report.categories.reduce((sum, g) => sum + g.bytes, 0),
+    report.blobSize
+  );
+  assert.ok(report.report.categories.find((g) => g.id === 'vectors').count > 0);
+  assert.ok(report.report.categories.find((g) => g.id === 'images').count > 0);
+  assert.ok(report.report.categories.find((g) => g.id === 'text').count > 0);
+  await page.evaluate(() => testCropper.renderLibrary());
+  assert.equal(await page.locator('.size-breakdown').getAttribute('open'), '');
+  assert.equal(await page.evaluate(() => testCropper.activeId), report.id);
+  const previous = await page.evaluate(
+    () => testCropper.selections[0].sizeBreakdown
+  );
+  await page.locator('#text-mode-toggle').check();
+  await page.waitForFunction(
+    () =>
+      testCropper.selections[0].previewState === 'ready' &&
+      testCropper.selections[0].sizeBreakdown?.categories.find(
+        (g) => g.id === 'text'
+      ).count === 0
+  );
+  const updated = await page.evaluate(
+    () => testCropper.selections[0].sizeBreakdown
+  );
+  assert.notDeepEqual(updated, previous);
+  assert.ok(
+    updated.categories.find((g) => g.id === 'vectors').count >
+      previous.categories.find((g) => g.id === 'vectors').count
+  );
+  assert.equal(await page.locator('.size-breakdown').getAttribute('open'), '');
+});
+
+test('PNG selections show their actual compressed file size', async (t) => {
+  const page = await app(t);
+  await clickImage(page, 1);
+  await page.locator('.size-breakdown summary').click();
+  await page.waitForFunction(() => !!testCropper.selections[0].sizeBreakdown);
+  const result = await page.evaluate(() => ({
+    report: testCropper.selections[0].sizeBreakdown,
+    bytes: testCropper.selections[0].blob.size,
+  }));
+  assert.equal(result.report.totalBytes, result.bytes);
+  assert.equal(result.report.categories.length, 1);
+  assert.equal(result.report.categories[0].label, 'PNG image');
+  assert.match(
+    await page.locator('[data-size-type="images"]').innerText(),
+    /100.0%/
+  );
+  await page.locator('.size-breakdown summary').click();
+  assert.equal(
+    await page.locator('.size-breakdown').getAttribute('open'),
+    null
+  );
+});
+
 test(
   'last-page logo in supplied PDF exports without warnings',
   { skip: !process.env.PDF_REGRESSION_PATH },

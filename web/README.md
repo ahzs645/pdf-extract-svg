@@ -34,7 +34,11 @@ the browser — no files are uploaded to any server.
    or use "Export all" to get the lot as a single zip named after the PDF. SVG
    is deflated in the archive; PNG is stored, since it is already compressed.
    Exporting all of a single selection just gives you that file, not an
-   archive.
+   archive. Open **Size breakdown** on an export to see the bytes and percentage
+   used by vectors, images, text, fonts/styles, and SVG structure, plus the types
+   and sizes of embedded images. This measures the complete downloaded file,
+   including data hidden by clipping. Analysis runs only when opened and updates
+   when the export changes; PNG exports report their compressed file size.
 8. **Export** — A region exports as SVG written by
    [MuPDF](https://mupdf.com/) via its WebAssembly build. MuPDF writes the page
    with the SVG viewport set to the selection, and the content translated so the
@@ -202,6 +206,9 @@ Extraction and asynchronous state are separate:
   Downloads wait for the current preview, and removed selections cannot retain
   their export or create a late object URL.
 - `geometry.js` holds shared transforms and SVG element identifiers.
+- `export-size.js` measures the serialized export by type without decoding its
+  assets. Category bytes add up to the actual file size, including UTF-8 text
+  and base64 overhead. Text outlines and vector definitions count as vectors.
 
 Run the state and resource lifecycle tests with:
 
