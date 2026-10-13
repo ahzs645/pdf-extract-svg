@@ -609,6 +609,258 @@ test('PNG selections show their actual compressed file size', async (t) => {
   );
 });
 
+test('Trim hidden content crops image pixels and can be turned off again', async (t) => {
+  const page = await app(t);
+  await page.evaluate(() =>
+    testCropper.addSelection({ page: 1, x: 60, y: 65, w: 40, h: 30 })
+  );
+  await page.waitForFunction(
+    () => testCropper.selections[0].previewState === 'ready'
+  );
+  const before = await page.evaluate(() => testCropper.selections[0].svgString);
+  await page.locator('#trim-hidden-toggle').check();
+  await page.waitForFunction(
+    () =>
+      testCropper.selections[0].previewState === 'ready' &&
+      !!testCropper.selections[0].trimReport
+  );
+  const result = await page.evaluate(async () => {
+    const sel = testCropper.selections[0],
+      doc = new DOMParser().parseFromString(sel.svgString, 'image/svg+xml');
+    const el = doc.querySelector('image');
+    const bitmap = await createImageBitmap(
+      await (await fetch(el.getAttribute('href'))).blob()
+    );
+    const dimensions = { w: bitmap.width, h: bitmap.height };
+    bitmap.close();
+    return { dimensions, report: sel.trimReport, svg: sel.svgString };
+  });
+  assert.deepEqual(result.dimensions, { w: 16, h: 12 });
+  assert.equal(result.report.croppedImages, 1);
+  assert.doesNotMatch(result.svg, /Infinity|NaN/);
+  await page.locator('.size-breakdown summary').click();
+  await page.waitForFunction(() => !!document.querySelector('.trim-report'));
+  assert.match(
+    await page.locator('.trim-report').innerText(),
+    /1 images cropped/
+  );
+  await page.locator('#trim-hidden-toggle').uncheck();
+  await page.waitForFunction(
+    () =>
+      testCropper.selections[0].previewState === 'ready' &&
+      !testCropper.selections[0].trimReport
+  );
+  assert.equal(
+    await page.evaluate(() => testCropper.selections[0].svgString),
+    before
+  );
+});
+
+test('physical vector cuts, nested clips, strokes and opaque occlusion preserve visible pixels', async (t) => {
+  const page = await app(t);
+  const results = await page.evaluate(async () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 20;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = 'blue';
+    ctx.fillRect(0, 0, 20, 20);
+    const image = canvas.toDataURL();
+    const cases = [
+      {
+        name: 'filled boundary',
+        body: '<path fill="red" d="M-10 -10H30V30H-10Z"/>',
+        cut: 1,
+      },
+      {
+        name: 'stroke boundary',
+        body: '<path fill="none" stroke="blue" stroke-width="4" stroke-linecap="round" d="M-10 10H30"/>',
+        cut: 1,
+      },
+      {
+        name: 'transformed clip with hole',
+        body: '<defs><clipPath id="cut"><path clip-rule="evenodd" d="M0 0H20V20H0Z M5 5V15H15V5Z"/></clipPath></defs><g transform="translate(2 2)" clip-path="url(#cut)"><path fill="red" d="M-10 -10H30V30H-10Z"/></g>',
+        cut: 1,
+      },
+      {
+        name: 'bounding-box clip',
+        body: '<defs><clipPath id="box" clipPathUnits="objectBoundingBox"><rect width=".5" height="1"/></clipPath></defs><path clip-path="url(#box)" transform="translate(2 2)" fill="red" d="M0 0H16V16H0Z"/>',
+        cut: 1,
+      },
+      {
+        name: 'partially clipped text',
+        body: '<text x="2" y="12" font-size="12">A long text run</text>',
+        preserved: 1,
+      },
+      {
+        name: 'covered image',
+        body: `<image width="20" height="20" href="${image}"/><rect width="20" height="20" fill="red"/>`,
+        removed: 1,
+      },
+      {
+        name: 'partially covered image',
+        body: `<image width="20" height="20" href="${image}"/><rect width="10" height="20" fill="red"/>`,
+        cropped: 1,
+      },
+      {
+        name: 'transparent overlay',
+        body: `<image width="20" height="20" href="${image}"/><rect width="20" height="20" fill="red" opacity=".5"/>`,
+        removed: 0,
+      },
+      {
+        name: 'invisible overlay',
+        body: `<image width="20" height="20" href="${image}"/><g style="display:none"><rect width="20" height="20" fill="red"/></g>`,
+        removed: 0,
+      },
+      {
+        name: 'nested effect inside clip definition',
+        body: `<defs><clipPath id="inner"><rect width="10" height="20"/></clipPath><clipPath id="outer"><g clip-path="url(#inner)"><rect width="20" height="20"/></g></clipPath></defs><g clip-path="url(#outer)"><image width="20" height="20" href="${image}"/></g>`,
+        preserved: 1,
+      },
+      {
+        name: 'empty clip',
+        body: `<defs><clipPath id="empty"/></defs><g clip-path="url(#empty)"><image width="20" height="20" href="${image}"/></g>`,
+        removed: 1,
+      },
+      {
+        name: 'curved image clip',
+        body: `<defs><clipPath id="circle"><circle cx="10" cy="10" r="8"/></clipPath></defs><g clip-path="url(#circle)"><image width="20" height="20" href="${image}"/></g>`,
+        preserved: 1,
+      },
+      {
+        name: 'gradient boundary',
+        body: '<defs><linearGradient id="paint"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient></defs><path fill="url(#paint)" d="M-10 -10H30V30H-10Z"/>',
+        preserved: 1,
+      },
+    ];
+    const exporter = testCropper.svgExporter,
+      original = exporter.buildSvgDom.bind(exporter);
+    async function pixels(svg) {
+      const url = URL.createObjectURL(
+        new Blob([svg], { type: 'image/svg+xml' })
+      );
+      try {
+        const img = new Image();
+        img.src = url;
+        await img.decode();
+        const c = document.createElement('canvas');
+        c.width = c.height = 80;
+        const context = c.getContext('2d');
+        context.drawImage(img, 0, 0, 80, 80);
+        return context.getImageData(0, 0, 80, 80).data;
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+    const results = [];
+    try {
+      for (const item of cases) {
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20">${item.body}</svg>`;
+        exporter.buildSvgDom = async () =>
+          new DOMParser().parseFromString(svg, 'image/svg+xml').documentElement;
+        const before = await exporter.buildSvg({ page: 1 });
+        let report;
+        const after = await exporter.buildSvg(
+          { page: 1 },
+          { trimHidden: true, onTrim: (r) => (report = r) }
+        );
+        const a = await pixels(before),
+          b = await pixels(after);
+        let changed = 0,
+          maxDifference = 0;
+        for (let i = 0; i < a.length; i += 4) {
+          let difference = 0;
+          for (let j = 0; j < 4; j++)
+            difference = Math.max(difference, Math.abs(a[i + j] - b[i + j]));
+          if (difference > 1) changed++;
+          maxDifference = Math.max(maxDifference, difference);
+        }
+        results.push({
+          ...item,
+          body: undefined,
+          report,
+          changed,
+          maxDifference,
+          hasImage: after.includes('<image'),
+          before,
+          after,
+        });
+      }
+    } finally {
+      exporter.buildSvgDom = original;
+    }
+    return results;
+  });
+  for (const result of results) {
+    assert.equal(
+      result.changed,
+      0,
+      `${result.name}: visible pixels changed (max ${result.maxDifference})`
+    );
+    if (result.cut !== undefined)
+      assert.equal(result.report.trimmedVectors, result.cut, result.name);
+    if (result.removed !== undefined)
+      assert.equal(result.report.removedObjects, result.removed, result.name);
+    if (result.cropped !== undefined)
+      assert.equal(result.report.croppedImages, result.cropped, result.name);
+    if (result.preserved !== undefined)
+      assert.equal(
+        result.report.preservedObjects,
+        result.preserved,
+        result.name
+      );
+    if (result.name === 'covered image' || result.name === 'empty clip')
+      assert.equal(result.hasImage, false, result.name);
+    assert.doesNotMatch(result.after, /Infinity|NaN/);
+  }
+});
+
+test('unused definition chains are removed while live nested definitions survive', async (t) => {
+  const page = await app(t);
+  const result = await page.evaluate(() => {
+    const root = new DOMParser().parseFromString(
+      `<svg xmlns="http://www.w3.org/2000/svg"><defs><g id="live"><defs><path id="nested" d="M0 0h10v10z"/></defs></g><g id="dead-a"><use href="#dead-b"/></g><g id="dead-b"><use href="#dead-a"/></g></defs><use href="#nested"/></svg>`,
+      'image/svg+xml'
+    ).documentElement;
+    const removed = testCropper.svgExporter.pruneUnusedDefs(root);
+    return {
+      removed,
+      ids: [...root.querySelectorAll('[id]')].map((el) => el.id),
+    };
+  });
+  assert.deepEqual(result, { removed: 2, ids: ['live', 'nested'] });
+});
+
+test('superseding a trim export releases its temporary SVG and commits the latest settings', async (t) => {
+  const page = await app(t);
+  const result = await page.evaluate(async () => {
+    const c = testCropper;
+    const source = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20">${'<path fill="red" d="M-10 -10H30V30H-10Z"/>'.repeat(600)}</svg>`;
+    c.svgExporter.buildSvgDom = async () =>
+      new DOMParser().parseFromString(source, 'image/svg+xml').documentElement;
+    const sel = c.addSelection({ page: 1, x: 10, y: 10, w: 20, h: 20 });
+    await c.previewStore.ensureReady(sel);
+    c.trimHidden = true;
+    const older = c.buildPreview(sel);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    c.trimHidden = false;
+    const latest = c.buildPreview(sel);
+    await Promise.all([older, latest]);
+    return {
+      state: sel.previewState,
+      trim: sel.trimReport,
+      pending: c.previewStore.jobs.size,
+      holders: document.querySelectorAll('body > div[style*="-20000px"]')
+        .length,
+    };
+  });
+  assert.deepEqual(result, {
+    state: 'ready',
+    trim: null,
+    pending: 0,
+    holders: 0,
+  });
+});
+
 test(
   'last-page logo in supplied PDF exports without warnings',
   { skip: !process.env.PDF_REGRESSION_PATH },

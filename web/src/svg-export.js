@@ -242,7 +242,7 @@ export class SvgExporter {
         try {
           const bbox = el.getBBox();
           const ctm = el.getScreenCTM();
-          if (!ctm || !bbox.width || !bbox.height) continue;
+          if (!ctm) continue;
           // A stroke is centred on the path, so it reaches half its width
           // past the geometry on every side. Both properties inherit, so the
           // value that applies may sit on an ancestor.
@@ -252,6 +252,7 @@ export class SvgExporter {
           const pad = stroke && stroke !== 'none'
             ? (Number.isFinite(width) ? width : 1) / 2
             : 0;
+          if ((!bbox.width || !bbox.height) && !pad) continue;
           const pts = [
             toScreen(ctm, bbox.x - pad, bbox.y - pad),
             toScreen(ctm, bbox.x + bbox.width + pad, bbox.y - pad),
@@ -289,27 +290,47 @@ export class SvgExporter {
    * the draws leaves the shapes behind unless they go too.
    */
   pruneUnusedDefs(svgElement) {
-    const defs = [...svgElement.querySelectorAll('defs > *')].filter((el) => el.id);
-    if (!defs.length) return 0;
-
-    // Every way one element can name another: url(#id) in a presentation
-    // attribute or a style declaration, and a plain #id in href.
-    const referenced = new Set();
-    for (const el of svgElement.querySelectorAll('*')) {
-      for (const { value } of el.attributes) {
-        for (const m of value.matchAll(/url\(\s*['"]?#([^)'"\s]+)/g)) {
-          referenced.add(m[1]);
-        }
-        if (value.startsWith('#')) referenced.add(value.slice(1));
+    const definitions = [...svgElement.querySelectorAll('defs')]
+      .filter((defs) => !defs.parentElement?.closest('defs'))
+      .flatMap((defs) => [...defs.children]);
+    const owners = new Map();
+    for (const definition of definitions) {
+      for (const node of [definition, ...definition.querySelectorAll('[id]')]) {
+        if (node.id) owners.set(node.id, definition);
       }
     }
-
+    const referenced = (node) => {
+      const ids = [];
+      for (const attr of node.attributes) {
+        for (const match of attr.value.matchAll(/url\(\s*['"]?#([^)'"\s]+)/g)) ids.push(match[1]);
+        if (attr.localName === 'href' && attr.value.startsWith('#')) ids.push(attr.value.slice(1));
+      }
+      if (node.tagName.toLowerCase() === 'style') {
+        for (const match of node.textContent.matchAll(/url\(\s*['"]?#([^)'"\s]+)/g)) ids.push(match[1]);
+      }
+      return ids;
+    };
+    const queue = [];
+    for (const node of [svgElement, ...svgElement.querySelectorAll('*')]) {
+      if (!node.closest('defs')) queue.push(...referenced(node));
+    }
+    const live = new Set();
+    // Styles have global effect even when they are inside <defs>.
+    for (const definition of definitions) {
+      if (definition.matches('style') || definition.querySelector('style')) {
+        live.add(definition);
+        for (const node of [definition, ...definition.querySelectorAll('*')]) queue.push(...referenced(node));
+      }
+    }
+    while (queue.length) {
+      const owner = owners.get(queue.pop());
+      if (!owner || live.has(owner)) continue;
+      live.add(owner);
+      for (const node of [owner, ...owner.querySelectorAll('*')]) queue.push(...referenced(node));
+    }
     let removed = 0;
-    for (const el of defs) {
-      // A definition can be referenced by another definition.
-      if (referenced.has(el.id)) continue;
-      el.remove();
-      removed++;
+    for (const definition of definitions) {
+      if (!live.has(definition)) { definition.remove(); removed++; }
     }
     return removed;
   }
@@ -471,7 +492,7 @@ export class SvgExporter {
   }
 
   /** Builds the SVG string for one selection, with edits applied. */
-  async buildSvg(sel) {
+  async buildSvg(sel, options = {}) {
     const root = await this.buildSvgDom(sel);
 
     for (const id of sel.deletedIds || []) {
@@ -480,6 +501,16 @@ export class SvgExporter {
     }
     for (const el of root.querySelectorAll(`[${EDIT_ATTR}]`)) {
       el.removeAttribute(EDIT_ATTR);
+    }
+
+    if (options.trimHidden) {
+      const { trimSvg } = await import('./svg-trim.js');
+      const report = await trimSvg(root, () => {
+        this.session.assertActive();
+        options.assertCurrent?.();
+      });
+      this.pruneUnusedDefs(root);
+      options.onTrim?.(report);
     }
 
     let svgString = new XMLSerializer().serializeToString(root);
@@ -499,7 +530,9 @@ export class SvgExporter {
               },
             },
           },
-          'removeOffCanvasPaths',
+          // Our geometry pass already prunes off-crop objects with transforms
+          // and strokes accounted for. SVGO's pass can drop a crossing stroke
+          // when both endpoints lie outside the viewport.
         ],
       }).data;
     } catch (svgoErr) {

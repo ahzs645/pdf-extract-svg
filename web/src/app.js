@@ -63,6 +63,7 @@ export class PdfCropper {
     this.moveOffsetY = 0;
 
     this.textAsOutlines = false;
+    this.trimHidden = false;
     this.pdfName = 'document';
     this.rasterExporter = null;
     this.svgExporter = null;
@@ -121,6 +122,7 @@ export class PdfCropper {
     this.dropRastersBtn = document.getElementById('drop-rasters-btn');
     this.objectsSummary = document.getElementById('objects-summary');
     this.textModeToggle = document.getElementById('text-mode-toggle');
+    this.trimHiddenToggle = document.getElementById('trim-hidden-toggle');
     this.editorOverlay = document.getElementById('editor-overlay');
     this.editorStage = document.getElementById('editor-stage');
     this.editorList = document.getElementById('editor-list');
@@ -252,6 +254,11 @@ export class PdfCropper {
       this.textAsOutlines = this.textModeToggle.checked;
       if (this.session) this.svgExporter = new SvgExporter(this.session, this.textAsOutlines);
       this.refreshObjectsIfNeeded();
+      this.rebuildAllPreviews();
+    });
+
+    this.trimHiddenToggle.addEventListener('change', () => {
+      this.trimHidden = this.trimHiddenToggle.checked;
       this.rebuildAllPreviews();
     });
 
@@ -1271,21 +1278,33 @@ export class PdfCropper {
     return this.svgExporter.buildSvgDom(sel);
   }
 
-  async buildExport(sel, rasterExporter = this.rasterExporter, svgExporter = this.svgExporter) {
+  async buildExport(sel, rasterExporter = this.rasterExporter, svgExporter = this.svgExporter,
+    options = { trimHidden: this.trimHidden }) {
     // Capture the exporter before awaiting; a new PDF owns new exporters.
     if (sel.source === 'image') {
       const raster = await rasterExporter.buildRaster(sel);
       return { blob: raster.blob, format: 'png',
-        pixelWidth: raster.width, pixelHeight: raster.height, sizeBreakdown: null };
+        pixelWidth: raster.width, pixelHeight: raster.height, sizeBreakdown: null, trimReport: null };
     }
-    const svgString = await svgExporter.buildSvg(sel);
+    let trimReport = null;
+    const svgString = await svgExporter.buildSvg(sel, {
+      ...options, onTrim: (report) => { trimReport = report; },
+    });
     return { blob: new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' }),
-      format: 'svg', svgString, pixelWidth: undefined, pixelHeight: undefined, sizeBreakdown: null };
+      format: 'svg', svgString, pixelWidth: undefined, pixelHeight: undefined,
+      sizeBreakdown: null, trimReport };
   }
 
   buildPreview(sel) {
     const raster = this.rasterExporter, svg = this.svgExporter;
-    return this.previewStore.buildPreview(sel, (snapshot) => this.buildExport(snapshot, raster, svg));
+    const token = (sel.previewToken || 0) + 1;
+    const options = { trimHidden: this.trimHidden, assertCurrent: () => {
+      if (sel.previewToken !== token || !this.selections.includes(sel)) {
+        throw new DOMException('Export was superseded', 'AbortError');
+      }
+    } };
+    return this.previewStore.buildPreview(sel,
+      (snapshot) => this.buildExport(snapshot, raster, svg, options));
   }
 
   get pdfDoc() { return this.session?.pdfDoc || null; }
@@ -1720,9 +1739,23 @@ export class PdfCropper {
       const note = document.createElement('p');
       note.className = 'size-note';
       note.textContent = sel.format === 'svg'
-        ? 'Includes embedded data and content hidden by clipping. Text outlines count as vectors.'
+        ? 'Measures the complete export, including any retained clipped data. Text outlines count as vectors.'
         : 'Size of the complete PNG file.';
       details.appendChild(note);
+      if (sel.trimReport) {
+        const trimmed = document.createElement('p');
+        trimmed.className = 'size-note trim-report';
+        const report = sel.trimReport;
+        trimmed.textContent = `Trimmed: ${report.removedObjects} objects removed, ` +
+          `${report.croppedImages} images cropped, ${report.trimmedVectors} vectors cut.`;
+        details.appendChild(trimmed);
+        if (report.preservedObjects) {
+          const retained = document.createElement('p');
+          retained.className = 'size-note trim-retained';
+          retained.textContent = `${report.preservedObjects} complex objects kept their original clipping.`;
+          details.appendChild(retained);
+        }
+      }
     };
     details.addEventListener('toggle', () => {
       if (!details.isConnected) return;

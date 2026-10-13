@@ -46,7 +46,12 @@ the browser — no files are uploaded to any server.
    by that viewport, so each element is measured against the crop and dropped if
    it misses; [SVGO](https://svgo.dev/) then compresses what is left. An image
    grabbed by clicking it exports as a PNG at the image's own pixel dimensions
-   instead, since wrapping a raster in SVG gains nothing. A solid-color mask
+   instead, since wrapping a raster in SVG gains nothing. Enable **Trim hidden
+   content** to physically cut supported vectors at clip boundaries, crop
+   embedded images to rectangular visible regions, and remove images proven
+   to be covered by later opaque rectangles. It is off by default. The Size
+   breakdown reports what was trimmed and which complex objects retained their
+   original clipping. A solid-color mask
    has no separate image data; clicking its box exports the visible page region
    at 300 DPI immediately, which also handles artwork within a full-page scan.
 9. **Fonts** — MuPDF names the font behind each text run but cannot embed it,
@@ -139,7 +144,7 @@ is 15 KB selectable against 43 KB outlined.
 ## Why the editor lists so many shapes
 
 MuPDF writes the whole page and the viewport is set to your selection, so the
-document holds shapes that fall outside the crop. SVGO prunes them on export,
+document can hold shapes that fall outside the crop. The exporter prunes them,
 but the editor works on the un-optimized document, so "Only shapes in the crop"
 is on by default and the count says how many were filtered out. What remains is
 genuinely in your selection — detailed artwork really can be eighty small paths.
@@ -150,18 +155,23 @@ genuinely in your selection — detailed artwork really can be eighty small path
 - Object mode only sees what the PDF draws as objects. On a scanned page the
   whole sheet is one image, so there is nothing to pick apart; use a region
   drag, or click the image to get it as PNG.
-- A region cropped from a scanned page still embeds the part of the scan that
-  the crop covers, since that raster is the content. Clicking the image to get a
-  PNG is usually the better route for scans.
+- A region from a scanned page contains raster artwork. **Trim hidden content**
+  crops an embedded image at its native pixel grid when its visible region is
+  rectangular. A curved clip or complex mask can retain the complete image;
+  retained cases are reported in Size breakdown.
 - Text exported as `<text>` names its fonts rather than embedding them. Use
   "Text as outlines" when the file has to render identically elsewhere.
 - The editor deletes shapes; it does not move, recolour or reshape them. For
   that, export the SVG and open it in Inkscape or Illustrator.
 - Shape ids are positional, so switching between text and outline mode after
   editing will not line the deletions up with the same shapes.
-- The full page is rendered to SVG and then cropped via `viewBox`. SVGO strips
-  off-canvas paths, but some content outside the selection may remain in the
-  SVG source, so file sizes are dominated by the page rather than the crop.
+- Default SVG exports keep complete objects that overlap the selection.
+  **Trim hidden content** cuts solid vector fills and supported strokes, including
+  transformed and nested clips, and drops unreachable definitions. Partially
+  clipped text, gradients, dashed strokes, markers, rounded rectangles, filters,
+  and complex masks may retain their source clipping. Cut edges can have small
+  antialiasing differences. For physically cut glyph shapes, use **Text as
+  outlines** as well. Trimming affects SVG exports; native PNG exports are unchanged.
 - "Highlight rasters" tints every raster image so you can see what will not
   export as vector. It is off by default, because the tint is painted into the
   page and makes a scanned page look discoloured.
@@ -202,6 +212,9 @@ Extraction and asynchronous state are separate:
 - `raster-export.js` detects images and builds native PNGs or 300 DPI crops.
 - `svg-export.js` handles MuPDF SVG generation, fonts, object indexing, filtering,
   and optimization. Cached SVGs and object indexes distinguish text and outlines.
+- `svg-trim.js` lazily loads Skia PathKit to intersect supported artwork with its
+  crop and clip paths. It frees every native path, checks cancellation during
+  large exports, and retains unsupported effects instead of changing their look.
 - `preview-store.js` snapshots selections and commits only the latest result.
   Downloads wait for the current preview, and removed selections cannot retain
   their export or create a late object URL.

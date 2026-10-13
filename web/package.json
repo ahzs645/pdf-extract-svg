@@ -14,6 +14,7 @@
   "dependencies": {
     "fflate": "^0.8.3",
     "mupdf": "^1.28.1",
+    "pathkit-wasm": "^1.0.0",
     "pdfjs-dist": "^4.10.38",
     "svgo": "^4.0.0"
   },
