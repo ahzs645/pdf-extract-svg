@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
+import { stripVTControlCharacters } from 'node:util';
 import { chromium } from 'playwright';
 import { unzipSync } from 'fflate';
 import { fixturePdf } from './pdf-fixtures.js';
@@ -35,7 +36,9 @@ test.before(async () => {
     );
     server.stdout.on('data', (chunk) => {
       output += chunk.toString();
-      const match = output.match(/http:\/\/127\.0\.0\.1:\d+\//);
+      const match = stripVTControlCharacters(output).match(
+        /http:\/\/127\.0\.0\.1:\d+\//
+      );
       if (match) {
         base = match[0];
         clearTimeout(timer);
