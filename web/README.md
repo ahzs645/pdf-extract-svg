@@ -42,7 +42,9 @@ the browser — no files are uploaded to any server.
    by that viewport, so each element is measured against the crop and dropped if
    it misses; [SVGO](https://svgo.dev/) then compresses what is left. An image
    grabbed by clicking it exports as a PNG at the image's own pixel dimensions
-   instead, since wrapping a raster in SVG gains nothing.
+   instead, since wrapping a raster in SVG gains nothing. A solid-color mask
+   has no separate image data; clicking its box exports the visible page region
+   at 300 DPI immediately, which also handles artwork within a full-page scan.
 9. **Fonts** — MuPDF names the font behind each text run but cannot embed it,
    and a subset name like `NNFDFE+Arial` matches nothing on any machine, so
    text alone exports in whatever face the viewer falls back to. PDF.js has
@@ -184,3 +186,46 @@ at any zoom level.
 | Ctrl/Cmd + `=` | Zoom in |
 | Ctrl/Cmd + `-` | Zoom out |
 | Ctrl/Cmd + `0` | Reset zoom |
+
+## Code structure and tests
+
+`app.js` owns the viewer controls, selections, library, and vector editor.
+Extraction and asynchronous state are separate:
+
+- `document-session.js` owns one PDF's bytes, PDF.js loading task and worker,
+  MuPDF document, page caches, and render cancellation. Replacing a PDF disposes
+  that session before rendering the next document.
+- `raster-export.js` detects images and builds native PNGs or 300 DPI crops.
+- `svg-export.js` handles MuPDF SVG generation, fonts, object indexing, filtering,
+  and optimization. Cached SVGs and object indexes distinguish text and outlines.
+- `preview-store.js` snapshots selections and commits only the latest result.
+  Downloads wait for the current preview, and removed selections cannot retain
+  their export or create a late object URL.
+- `geometry.js` holds shared transforms and SVG element identifiers.
+
+Run the state and resource lifecycle tests with:
+
+```sh
+npm test
+```
+
+Install the browser used by the integration tests once, then test the production
+bundle (including PNG pixels, SVG editing, ZIP downloads, and document switching):
+
+```sh
+npx playwright install chromium
+npm run test:production
+```
+
+For development-server checks, use `npm run test:browser`. Tests generate their
+own small PDF fixtures. To additionally exercise a local regression document:
+
+```sh
+PDF_REGRESSION_PATH=/absolute/path/to/document.pdf npm run test:production
+```
+
+That optional check expects the 97-page British Columbia document used for the
+last-page logo regression. Set `PDF_REGRESSION_PNG` to a known-good logo PNG to
+also compare the downloaded bytes. Personal PDFs and reference images are not
+included in the repository. GitHub Actions runs the generated-fixture tests and
+production build on web changes.

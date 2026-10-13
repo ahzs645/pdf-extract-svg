@@ -1,0 +1,561 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { readFile } from 'node:fs/promises';
+import { chromium } from 'playwright';
+import { unzipSync } from 'fflate';
+import { fixturePdf } from './pdf-fixtures.js';
+
+const fixture = {
+  name: 'extraction-fixtures.pdf',
+  mimeType: 'application/pdf',
+  buffer: fixturePdf(),
+};
+let server, browser, base;
+
+test.before(async () => {
+  server = spawn(
+    process.execPath,
+    [
+      'node_modules/vite/bin/vite.js',
+      ...(process.env.BROWSER_TEST_MODE === 'production' ? ['preview'] : []),
+      '--host',
+      '127.0.0.1',
+      '--port',
+      '0',
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] }
+  );
+  await new Promise((resolve, reject) => {
+    let output = '';
+    const timer = setTimeout(
+      () => reject(Error(`Server did not start: ${output}`)),
+      15000
+    );
+    server.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+      const match = output.match(/http:\/\/127\.0\.0\.1:\d+\//);
+      if (match) {
+        base = match[0];
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    server.once('exit', (code) => {
+      clearTimeout(timer);
+      reject(Error(`Server exited ${code}: ${output}`));
+    });
+  });
+  browser = await chromium.launch({ headless: true });
+});
+test.after(async () => {
+  await browser?.close();
+  if (server && server.exitCode === null) {
+    const ended = once(server, 'exit');
+    server.kill();
+    await ended;
+  }
+});
+async function app(t) {
+  const page = await browser.newPage({
+      viewport: { width: 1300, height: 1000 },
+    }),
+    errors = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  page.on('console', (msg) => {
+    if (['error', 'warning'].includes(msg.type())) errors.push(msg.text());
+  });
+  page.on('response', (r) => {
+    if (r.status() >= 400) errors.push(`${r.status()} ${r.url()}`);
+  });
+  await page.route(
+    /\/(?:src\/app\.js|assets\/index-[^/]+\.js)(?:\?.*)?$/,
+    async (route) => {
+      const response = await route.fetch(),
+        body = await response.text();
+      const instrumented =
+        process.env.BROWSER_TEST_MODE === 'production'
+          ? body.replace(
+              /new ([\w$]+)\(\)\.init\(\)(?=\}\);)/,
+              '(globalThis.testCropper = new $1()).init()'
+            )
+          : body.replace(
+              'cropper.init();',
+              'globalThis.testCropper = cropper; cropper.init();'
+            );
+      assert.notEqual(
+        instrumented,
+        body,
+        'Application test hook must be installed'
+      );
+      await route.fulfill({ response, body: instrumented });
+    }
+  );
+  await page.goto(base);
+  t.after(async () => {
+    await page.close();
+    assert.deepEqual(errors, [], 'Browser should have no errors or warnings');
+  });
+  await page.locator('#file-input').setInputFiles(fixture);
+  await page.waitForFunction(
+    () =>
+      testCropper.pdfDoc?.numPages === 4 &&
+      !testCropper.pageRendering &&
+      testCropper.pageImages.length === 1
+  );
+  return page;
+}
+async function go(page, num) {
+  await page.locator('#page-input').fill(String(num));
+  await page.locator('#page-input').press('Enter');
+  await page.waitForFunction(
+    (num) =>
+      testCropper.pageNum === num &&
+      !testCropper.pageRendering &&
+      testCropper.pageInput.value === String(num),
+    num
+  );
+}
+async function clickImage(page, count) {
+  await page.waitForFunction(() => testCropper.pageImages.length > 0);
+  const box = await page.locator('.image-hotspot').first().boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForFunction(
+    (count) =>
+      testCropper.selections.length === count &&
+      testCropper.selections[count - 1].previewState === 'ready',
+    count
+  );
+}
+async function png(page, index, w, h, color) {
+  const result = await page.evaluate(
+    async ({ index, color }) => {
+      const s = testCropper.selections[index],
+        b = await createImageBitmap(s.blob),
+        canvas = document.createElement('canvas');
+      canvas.width = b.width;
+      canvas.height = b.height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(b, 0, 0);
+      const pixels = ctx.getImageData(0, 0, b.width, b.height).data;
+      let mismatches = 0;
+      if (color)
+        for (let i = 0; i < pixels.length; i += 4)
+          if (
+            pixels[i] !== color[0] ||
+            pixels[i + 1] !== color[1] ||
+            pixels[i + 2] !== color[2] ||
+            pixels[i + 3] !== 255
+          )
+            mismatches++;
+      return { width: b.width, height: b.height, mismatches, format: s.format };
+    },
+    { index, color }
+  );
+  assert.deepEqual(result, {
+    width: w,
+    height: h,
+    mismatches: 0,
+    format: 'png',
+  });
+}
+
+test('native and inline images retain exact dimensions and colors; ZIP contains both', async (t) => {
+  const page = await app(t);
+  await clickImage(page, 1);
+  await png(page, 0, 32, 24, [27, 135, 49]);
+  await go(page, 2);
+  await clickImage(page, 2);
+  await png(page, 1, 2, 2, [45, 72, 190]);
+  const downloading = page.waitForEvent('download');
+  await page.locator('#export-all-btn').click();
+  const download = await downloading;
+  assert.equal(
+    download.suggestedFilename(),
+    'extraction-fixtures-selections.zip'
+  );
+  const bytes = await readFile(await download.path());
+  const entries = unzipSync(bytes);
+  assert.deepEqual(Object.keys(entries), [
+    'page-1-selection-1.png',
+    'page-2-selection-2.png',
+  ]);
+  assert.deepEqual(
+    [...entries['page-1-selection-1.png'].slice(0, 8)],
+    [137, 80, 78, 71, 13, 10, 26, 10]
+  );
+});
+
+test('solid masks without image IDs crop the visible scan immediately', async (t) => {
+  const page = await app(t);
+  await go(page, 3);
+  const start = Date.now();
+  await clickImage(page, 1);
+  assert.ok(Date.now() - start < 3000, 'No nonexistent-image timeout');
+  const shape = await page.evaluate(() => {
+    const s = testCropper.selections[0];
+    return { id: s.objId, inline: s.inlineData };
+  });
+  assert.deepEqual(shape, { id: null, inline: null });
+  await png(page, 0, 333, 250);
+});
+
+test('vector region, object filtering, editor deletion/undo and outlined text export', async (t) => {
+  const page = await app(t);
+  await go(page, 4);
+  await page.evaluate(() =>
+    testCropper.addSelection({ page: 4, x: 10, y: 15, w: 170, h: 130 })
+  );
+  await page.waitForFunction(
+    () =>
+      testCropper.selections[0].previewState === 'ready' &&
+      testCropper.pageObjects.length >= 3
+  );
+  const text = await page.evaluate(() => testCropper.selections[0].svgString);
+  assert.match(text, /<text/);
+  assert.match(text, /Vector export/);
+  await page.locator('#edit-btn').click();
+  await page.waitForFunction(() => testCropper.editorItems.length >= 3);
+  await page.evaluate(() => {
+    const item = testCropper.editorItems.find((i) => i.type === 'vector');
+    testCropper.setEditorSelection(item.id);
+  });
+  await page.locator('#editor-delete-btn').click();
+  assert.equal(await page.evaluate(() => testCropper.editorDeleted.size), 1);
+  await page.locator('#editor-undo-btn').click();
+  assert.equal(await page.evaluate(() => testCropper.editorDeleted.size), 0);
+  await page.locator('#editor-delete-btn').click();
+  await page.locator('#editor-done-btn').click();
+  await page.waitForFunction(
+    () => testCropper.selections[0].previewState === 'ready'
+  );
+  assert.equal(
+    await page.evaluate(() => testCropper.selections[0].deletedIds.length),
+    1
+  );
+  await page.locator('#text-mode-toggle').check();
+  await page.waitForFunction(
+    () =>
+      testCropper.selections[0].previewState === 'ready' &&
+      !testCropper.selections[0].svgString.includes('<text')
+  );
+  await page.locator('#object-mode-btn').click();
+  await page.waitForFunction(() => testCropper.pageObjects.length >= 3);
+  await page.evaluate(() => {
+    testCropper.clearLibrary();
+    testCropper.toggleObjectInSelection(
+      testCropper.pageObjects.find((o) => o.type === 'vector')
+    );
+  });
+  await page.waitForFunction(
+    () => testCropper.selections[0].previewState === 'ready'
+  );
+  const filtered = await page.evaluate(
+    () => testCropper.selections[0].svgString
+  );
+  assert.doesNotMatch(filtered, /<text/);
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#download-btn').click();
+  assert.match((await downloadPromise).suggestedFilename(), /\.svg$/);
+});
+
+test('switching PDF during an export cancels the old session and keeps the new app usable', async (t) => {
+  const page = await app(t);
+  await page.evaluate(() => {
+    const c = testCropper;
+    globalThis.oldSession = c.session;
+    const original = c.rasterExporter.buildRaster.bind(c.rasterExporter);
+    c.rasterExporter.buildRaster = async (s) => {
+      await new Promise((resolve) => (globalThis.releaseOldExport = resolve));
+      return original(s);
+    };
+    c.addSelection({ page: 1, source: 'image', ...c.pageImages[0] });
+  });
+  await page.waitForFunction(() => !!globalThis.releaseOldExport);
+  await page
+    .locator('#file-input')
+    .setInputFiles({ ...fixture, name: 'replacement.pdf' });
+  await page.waitForFunction(
+    () =>
+      testCropper.session !== oldSession &&
+      testCropper.pdfDoc?.numPages === 4 &&
+      !testCropper.pageRendering
+  );
+  await page.evaluate(() => releaseOldExport());
+  await page.evaluate(() => oldSession.disposePromise);
+  const cleanup = await page.evaluate(() => ({
+    aborted: oldSession.signal.aborted,
+    doc: oldSession.pdfDoc,
+    bytes: oldSession.bytes,
+    mu: oldSession.muDoc,
+    selections: testCropper.selections.length,
+  }));
+  assert.deepEqual(cleanup, {
+    aborted: true,
+    doc: null,
+    bytes: null,
+    mu: null,
+    selections: 0,
+  });
+  await clickImage(page, 1);
+  await png(page, 0, 32, 24, [27, 135, 49]);
+});
+
+test('image object reads cancel promptly when their document closes', async (t) => {
+  const page = await app(t);
+  const result = await page.evaluate(async () => {
+    const c = testCropper,
+      old = c.session;
+    const read = c.rasterExporter.getImageObject(
+      { objs: { has: () => false, get() {} } },
+      'missing'
+    );
+    const rejected = read.then(
+      () => 'resolved',
+      (error) => error.name
+    );
+    await old.dispose();
+    return await rejected;
+  });
+  assert.equal(result, 'AbortError');
+});
+
+test('closed editors cannot remount a late SVG', async (t) => {
+  const page = await app(t);
+  await go(page, 4);
+  const result = await page.evaluate(async () => {
+    const c = testCropper,
+      sel = { page: 4, x: 10, y: 10, w: 180, h: 140 };
+    const build = c.buildSvgDom.bind(c);
+    let release;
+    c.buildSvgDom = async (s) => {
+      await new Promise((resolve) => (release = resolve));
+      return build(s);
+    };
+    const opening = c.openEditor(sel);
+    c.closeEditor(false);
+    release();
+    await opening;
+    return {
+      root: c.editorRoot,
+      children: c.editorStage.children.length,
+      closed: c.editorOverlay.classList.contains('hidden'),
+    };
+  });
+  assert.deepEqual(result, { root: null, children: 0, closed: true });
+});
+
+test('overlapping previews cannot serve different content than the visible preview', async (t) => {
+  const page = await app(t);
+  await go(page, 4);
+  const result = await page.evaluate(async () => {
+    const c = testCropper,
+      releases = [];
+    c.svgExporter.buildSvg = (s) =>
+      new Promise((resolve) => releases.push({ resolve, x: s.x }));
+    const selection = c.addSelection({ page: 4, x: 10, y: 10, w: 50, h: 50 });
+    await Promise.resolve();
+    await Promise.resolve();
+    selection.x = 100;
+    const latest = c.buildPreview(selection);
+    await Promise.resolve();
+    await Promise.resolve();
+    const original = releases[0];
+    const svg = (color) =>
+      `<svg xmlns="http://www.w3.org/2000/svg"><rect width="50" height="50" fill="${color}"/></svg>`;
+    releases[1].resolve(svg('blue'));
+    await latest;
+    original.resolve(svg('red'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return {
+      download: await selection.blob.text(),
+      preview: await (await fetch(selection.previewUrl)).text(),
+      positions: releases.map((r) => r.x),
+      state: selection.previewState,
+    };
+  });
+  assert.equal(result.download, result.preview);
+  assert.match(result.download, /blue/);
+  assert.deepEqual(result.positions, [10, 100]);
+  assert.equal(result.state, 'ready');
+});
+
+test('a superseded page render cannot paint over the requested page', async (t) => {
+  const page = await app(t);
+  await page.evaluate(() => {
+    const c = testCropper,
+      render = c.session.render.bind(c.session);
+    c.session.render = async (p, options) => {
+      if (p.pageNumber === 2)
+        await new Promise((resolve) => (globalThis.releasePage = resolve));
+      return render(p, options);
+    };
+    const draw = c.ctx.drawImage.bind(c.ctx);
+    globalThis.pageCommits = 0;
+    c.ctx.drawImage = (...args) => {
+      pageCommits++;
+      draw(...args);
+    };
+    c.goToPage(2);
+  });
+  await page.waitForFunction(() => !!globalThis.releasePage);
+  await page.evaluate(() => {
+    testCropper.goToPage(4);
+    releasePage();
+  });
+  await page.waitForFunction(
+    () =>
+      !testCropper.pageRendering &&
+      testCropper.pageNum === 4 &&
+      testCropper.pageInput.value === '4'
+  );
+  assert.equal(
+    await page.evaluate(() => pageCommits),
+    1,
+    'Only the requested page should be committed'
+  );
+  const pixels = await page.evaluate(() => [
+    ...testCropper.ctx.getImageData(45, 135, 1, 1).data,
+  ]);
+  assert.ok(
+    pixels[0] > 150 && pixels[1] < 100 && pixels[2] < 100,
+    `Expected page 4's red vector, got ${pixels}`
+  );
+});
+
+test('replacing a document releases an opened MuPDF document and its worker', async (t) => {
+  const page = await app(t);
+  await go(page, 4);
+  await page.evaluate(async () => {
+    const c = testCropper;
+    globalThis.replacedSession = c.session;
+    const doc = await c.session.getMuDoc(),
+      destroy = doc.destroy.bind(doc);
+    globalThis.muDestroyed = 0;
+    doc.destroy = () => {
+      muDestroyed++;
+      destroy();
+    };
+    await c.loadPDF(new Uint8Array(await c.session.bytes.slice()), 'new-file');
+  });
+  await page.waitForFunction(
+    () =>
+      testCropper.pdfDoc?.numPages === 4 &&
+      !testCropper.pageRendering &&
+      testCropper.pageImages.length === 1
+  );
+  const cleanup = await page.evaluate(() => ({
+    count: muDestroyed,
+    oldMu: replacedSession.muDoc,
+    oldBytes: replacedSession.bytes,
+    caches: Object.values(replacedSession.caches).map((c) => c.size),
+  }));
+  assert.deepEqual(cleanup, {
+    count: 1,
+    oldMu: null,
+    oldBytes: null,
+    caches: [0, 0, 0, 0],
+  });
+  await clickImage(page, 1);
+  await png(page, 0, 32, 24, [27, 135, 49]);
+});
+
+test('slow file reads cannot replace a more recently opened PDF', async (t) => {
+  const page = await app(t);
+  const result = await page.evaluate(async () => {
+    const c = testCropper,
+      bytes = c.session.bytes.slice();
+    let release;
+    const slow = c.loadFile({
+      name: 'older.pdf',
+      arrayBuffer: () => new Promise((resolve) => (release = resolve)),
+    });
+    await c.loadFile({
+      name: 'latest.pdf',
+      arrayBuffer: async () => bytes.slice().buffer,
+    });
+    release(bytes.slice().buffer);
+    await slow;
+    return {
+      name: c.pdfName,
+      pages: c.pdfDoc.numPages,
+      rendering: c.pageRendering,
+    };
+  });
+  assert.deepEqual(result, { name: 'latest', pages: 4, rendering: false });
+  await clickImage(page, 1);
+  await png(page, 0, 32, 24, [27, 135, 49]);
+});
+
+test('zoom and raster highlighting preserve the native export', async (t) => {
+  const page = await app(t);
+  await clickImage(page, 1);
+  const before = await page.evaluate(() => ({
+    x: testCropper.selections[0].x,
+    y: testCropper.selections[0].y,
+    w: testCropper.selections[0].w,
+    h: testCropper.selections[0].h,
+  }));
+  // Read through a small test canvas so polling does not change the viewer's
+  // GPU-backed canvas behavior or trigger Chromium's readback warning.
+  await page.evaluate(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 1;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    globalThis.viewerPixel = (x, y) => {
+      ctx.drawImage(testCropper.canvas, x, y, 1, 1, 0, 0, 1, 1);
+      return ctx.getImageData(0, 0, 1, 1).data;
+    };
+  });
+  await page.locator('#tint-toggle').check();
+  await page.waitForFunction(
+    () => !testCropper.pageRendering && viewerPixel(120, 120)[0] > 50
+  );
+  await page.evaluate(() => testCropper.zoomBy(2));
+  await page.waitForFunction(
+    () =>
+      !testCropper.pageRendering &&
+      testCropper.canvas.width === 600 &&
+      testCropper.renderedScale === 3
+  );
+  const after = await page.evaluate(() => ({
+    x: testCropper.selections[0].x,
+    y: testCropper.selections[0].y,
+    w: testCropper.selections[0].w,
+    h: testCropper.selections[0].h,
+  }));
+  assert.deepEqual(after, before);
+  await png(page, 0, 32, 24, [27, 135, 49]);
+  await page.locator('#tint-toggle').uncheck();
+  await page.waitForFunction(
+    () => !testCropper.pageRendering && viewerPixel(240, 240)[0] === 27
+  );
+});
+
+test(
+  'last-page logo in supplied PDF exports without warnings',
+  { skip: !process.env.PDF_REGRESSION_PATH },
+  async (t) => {
+    const page = await app(t);
+    await page
+      .locator('#file-input')
+      .setInputFiles(process.env.PDF_REGRESSION_PATH);
+    await page.waitForFunction(
+      () => testCropper.pdfDoc?.numPages === 97 && !testCropper.pageRendering
+    );
+    await go(page, 97);
+    await page.waitForFunction(() => testCropper.pageImages.length === 3);
+    const start = Date.now();
+    await clickImage(page, 1);
+    assert.ok(Date.now() - start < 3000);
+    await png(page, 0, 644, 468);
+    const expected = process.env.PDF_REGRESSION_PNG
+      ? await readFile(process.env.PDF_REGRESSION_PNG)
+      : null;
+    const downloading = page.waitForEvent('download');
+    await page.locator('#download-btn').click();
+    const actual = await readFile(await (await downloading).path());
+    if (expected) assert.deepEqual(actual, expected);
+  }
+);

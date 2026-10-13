@@ -15,46 +15,24 @@
 import './app.css';
 import * as pdfjsLib from 'pdfjs-dist';
 import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker';
-import { optimize as svgOptimize } from 'svgo/browser';
-import { buildFontCss, usageKey } from './fonts.js';
+import { DocumentSession, isCancelled } from './document-session.js';
+import { RasterExporter } from './raster-export.js';
+import { SvgExporter } from './svg-export.js';
+import { PreviewStore } from './preview-store.js';
+import { EDIT_ATTR } from './geometry.js';
 import { zip as zipAsync } from 'fflate';
-
-// PDF.js ships an ES-module worker from v4 on. Letting Vite construct it as a
-// module worker avoids "Cannot use import statement outside a module".
-pdfjsLib.GlobalWorkerOptions.workerPort = new PdfWorker();
 
 const DEFAULT_SCALE = 1.5;
 const MIN_SCALE = 0.25;
 const MAX_SCALE = 8;
 const ZOOM_STEP = 1.25;
-const MAX_OBJECTS = 4000;
 
-/** Multiplies two PDF transform matrices, [a, b, c, d, e, f]. */
-function mulMatrix(m1, m2) {
-  return [
-    m1[0] * m2[0] + m1[2] * m2[1],
-    m1[1] * m2[0] + m1[3] * m2[1],
-    m1[0] * m2[2] + m1[2] * m2[3],
-    m1[1] * m2[2] + m1[3] * m2[3],
-    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
-    m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
-  ];
-}
-
-/** Applies a PDF transform matrix to a point. */
-function applyMatrix(x, y, m) {
-  return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
-}
-const SVG_NS = 'http://www.w3.org/2000/svg';
-const OBJ_ATTR = 'data-obj-id';
-const EDIT_ATTR = 'data-el-id';
-const DRAWABLE_SELECTOR =
-  'path, text, image, use, rect, circle, ellipse, polygon, polyline';
-
-class PdfCropper {
+export class PdfCropper {
   constructor() {
     // PDF state
-    this.pdfDoc = null;
+    this.session = null;
+    this.loadRequest = 0;
+    this.renderTask = null;
     this.pageNum = 1;
     this.pageRendering = false;
     this.pageNumPending = null;
@@ -83,19 +61,16 @@ class PdfCropper {
     this.moveOffsetX = 0;
     this.moveOffsetY = 0;
 
-    // Cache of full-page SVG renders, keyed by page number, so that several
-    // selections on one page don't each re-render the page.
-    this.pageSvgCache = new Map();
-
-    // Cache of the fonts PDF.js parsed for a page, keyed by page number.
-    this.pageFontCache = new Map();
-
-    // MuPDF is the SVG export engine, loaded on first export.
-    this.pdfBytes = null;
-    this.muPromise = null;
-    this.muDocPromise = null;
     this.textAsOutlines = false;
     this.pdfName = 'document';
+    this.rasterExporter = null;
+    this.svgExporter = null;
+    this.previewStore = new PreviewStore({
+      build: (sel) => this.buildExport(sel),
+      isActive: (sel) => !!this.session && !this.session.signal.aborted &&
+        this.selections.includes(sel),
+      onChange: () => { this.renderLibrary(); this.updateDownloadButton(); },
+    });
 
     // Vector editor
     this.editorSel = null;
@@ -106,12 +81,10 @@ class PdfCropper {
     this.editorUndo = [];
 
     // Detected images, so a figure can be grabbed with a single click.
-    this.imageCache = new Map();
     this.pageImages = [];
     this.showImages = true;
 
     // Per-page object index, for the objects panel and object mode.
-    this.objectCache = new Map();
     this.pageObjects = [];
     this.mode = 'region';
   }
@@ -215,7 +188,7 @@ class PdfCropper {
     this.prevBtn.addEventListener('click', () => this.goToPage(this.pageNum - 1));
     this.nextBtn.addEventListener('click', () => this.goToPage(this.pageNum + 1));
     this.pageInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
+      if (e.key === 'Enter' && this.pdfDoc) {
         const num = parseInt(this.pageInput.value, 10);
         if (num >= 1 && num <= this.pdfDoc.numPages) {
           this.goToPage(num);
@@ -276,8 +249,8 @@ class PdfCropper {
     // Text as real <text> or as outlines changes every subsequent export.
     this.textModeToggle.addEventListener('change', () => {
       this.textAsOutlines = this.textModeToggle.checked;
-      this.pageSvgCache.clear();
-      this.objectCache.clear();
+      if (this.session) this.svgExporter = new SvgExporter(this.session, this.textAsOutlines);
+      this.refreshObjectsIfNeeded();
       this.rebuildAllPreviews();
     });
 
@@ -373,123 +346,158 @@ class PdfCropper {
 
   // -------- File loading --------
 
-  loadFile(file) {
-    this.pdfName = file.name.replace(/\.pdf$/i, '') || 'document';
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const data = new Uint8Array(event.target.result);
-      // PDF.js transfers (and detaches) the buffer it is given, so MuPDF needs
-      // its own copy taken before that happens.
-      this.pdfBytes = data.slice();
-      this.loadPDF(data);
-    };
-    reader.readAsArrayBuffer(file);
+  async loadFile(file) {
+    const request = ++this.loadRequest;
+    try {
+      const data = new Uint8Array(await file.arrayBuffer());
+      if (request !== this.loadRequest) return;
+      await this.loadPDF(data, file.name.replace(/\.pdf$/i, '') || 'document', request);
+    } catch (error) {
+      if (request !== this.loadRequest) return;
+      console.error('PDF load failed:', error);
+      alert('Error loading PDF: ' + error.message);
+    }
   }
 
-  async loadPDF(data) {
-    try {
-      this.pdfDoc = await pdfjsLib.getDocument({
-        data,
-        // Decode images to plain typed arrays rather than ImageBitmaps, which
-        // is what the native-format PNG extraction reads.
-        isOffscreenCanvasSupported: false,
-        // Keep the character-code tables alongside each parsed font. SVG
-        // export needs them to give an embedded font a Unicode cmap.
-        fontExtraProperties: true,
-        // NOTE: pdfjs-dist is held at 4.x deliberately. From 5.0 on, CCITT
-        // stencil image masks stop rendering -- monocult.pdf loses both of its
-        // cover illustrations. 4.10.38 is the newest release that draws them,
-        // and it is already past the GHSA-wgrm-67xf-hhpq fix.
-      }).promise;
-      this.pageNum = 1;
-      this.clearLibrary();
-      this.pageSvgCache.clear();
-      this.pageFontCache.clear();
-      this.imageCache.clear();
-      this.pageImages = [];
-      this.objectCache.clear();
-      this.pageObjects = [];
-      this.muDocPromise = null;
+  createDocumentSession(data) {
+    return new DocumentSession(data, {
+      createLoadingTask: (bytes) => {
+        // Each document owns its worker; disposing it cannot stop the next PDF.
+        const port = new PdfWorker();
+        const worker = new pdfjsLib.PDFWorker({ port });
+        try {
+          return {
+            loadingTask: pdfjsLib.getDocument({
+              data: bytes, worker,
+              isOffscreenCanvasSupported: false,
+              fontExtraProperties: true,
+            }),
+            disposeWorker: () => { worker.destroy(); port.terminate(); },
+          };
+        } catch (error) {
+          worker.destroy();
+          port.terminate();
+          throw error;
+        }
+      },
+    });
+  }
 
-      // Show the app, hide drop zone
+  async loadPDF(data, name = 'document', request = ++this.loadRequest) {
+    const previous = this.session;
+    const session = this.createDocumentSession(data);
+    this.session = session;
+    this.pdfName = name;
+    this.rasterExporter = new RasterExporter(session);
+    this.svgExporter = new SvgExporter(session, this.textAsOutlines);
+    clearTimeout(this.rerenderTimer);
+    this.closeEditor(false);
+    this.clearLibrary();
+    this.pageNum = 1;
+    this.pageNumPending = null;
+    this.pageImages = [];
+    this.pageObjects = [];
+    this.isDragging = false;
+    this.isMoving = false;
+    this.selectionBox.style.display = 'none';
+    this.renderImageLayer();
+    this.renderObjectLayer();
+    this.prevBtn.disabled = true;
+    this.nextBtn.disabled = true;
+    this.pageInput.disabled = true;
+    this.statusText.textContent = 'Loading PDF…';
+
+    try {
+      // Cancel old renders and let their canvas work finish before reuse.
+      await previous?.dispose();
+      if (this.session !== session || request !== this.loadRequest) return;
+      const doc = await session.ready();
+      if (this.session !== session || request !== this.loadRequest) return;
       this.dropZone.classList.add('hidden');
       this.app.classList.remove('hidden');
-
-      this.pageCountSpan.textContent = this.pdfDoc.numPages;
-      this.pageInput.max = this.pdfDoc.numPages;
+      this.pageCountSpan.textContent = doc.numPages;
+      this.pageInput.max = doc.numPages;
       this.statusText.textContent = 'Drag to select a region';
-
-      this.renderPage(this.pageNum);
+      await this.renderPage(1);
+      if (this.session !== session) return;
+      this.pageInput.disabled = false;
       this.updateNav();
-    } catch (err) {
-      console.error(err);
-      alert('Error loading PDF: ' + err.message);
+    } catch (error) {
+      if (this.session !== session || isCancelled(error, session)) return;
+      await session.dispose();
+      this.session = null;
+      this.statusText.textContent = 'Could not load PDF';
+      throw error;
     }
   }
 
   // -------- Page rendering --------
 
   async renderPage(num) {
+    const session = this.session;
+    if (!session || session.signal.aborted) return;
+    const job = {};
+    this.renderTask = job;
     this.pageRendering = true;
-
     try {
-      const page = await this.pdfDoc.getPage(num);
+      const page = await session.getPage(num);
       const viewport = page.getViewport({ scale: this.scale });
-
-      this.canvas.width = Math.round(viewport.width);
-      this.canvas.height = Math.round(viewport.height);
-      this.renderedScale = this.scale;
-      this.applyDisplayScale();
-
-      // Wrap drawImage to tint raster images so the user can see what
-      // won't export as vector SVG.
-      const origDrawImage = this.ctx.drawImage.bind(this.ctx);
-      const tintDrawImage = (...args) => {
-        origDrawImage(...args);
-
-        // Determine the destination rectangle
-        let dx, dy, dw, dh;
-        if (args.length === 3) {
-          [, dx, dy] = args;
-          dw = args[0].width;
-          dh = args[0].height;
-        } else if (args.length === 5) {
-          [, dx, dy, dw, dh] = args;
-        } else if (args.length === 9) {
-          [, , , , , dx, dy, dw, dh] = args;
-        }
-
-        if (dw && dh) {
-          this.ctx.save();
-          this.ctx.fillStyle = 'rgba(255, 140, 0, 0.25)';
-          this.ctx.fillRect(dx, dy, dw, dh);
-          this.ctx.restore();
-        }
-      };
-
+      const scale = this.scale;
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const ctx = canvas.getContext('2d');
+      const drawImage = ctx.drawImage.bind(ctx);
       if (this.tintRasters) {
-        this.ctx.drawImage = tintDrawImage;
+        ctx.drawImage = (...args) => {
+          drawImage(...args);
+          let dx, dy, dw, dh;
+          if (args.length === 3) {
+            [, dx, dy] = args;
+            dw = args[0].width; dh = args[0].height;
+          } else if (args.length === 5) {
+            [, dx, dy, dw, dh] = args;
+          } else if (args.length === 9) {
+            [, , , , , dx, dy, dw, dh] = args;
+          }
+          if (dw && dh) {
+            ctx.save();
+            ctx.fillStyle = 'rgba(255, 140, 0, 0.25)';
+            ctx.fillRect(dx, dy, dw, dh);
+            ctx.restore();
+          }
+        };
       }
-
-      await page.render({ canvasContext: this.ctx, viewport }).promise;
-
-      // Restore original drawImage
-      this.ctx.drawImage = origDrawImage;
-
-      this.pageRendering = false;
+      try {
+        await session.render(page, { canvasContext: ctx, viewport });
+      } finally {
+        ctx.drawImage = drawImage;
+      }
+      if (this.session !== session || this.renderTask !== job || num !== this.pageNum) return;
+      this.canvas.width = canvas.width;
+      this.canvas.height = canvas.height;
+      this.ctx.drawImage(canvas, 0, 0);
+      this.renderedScale = scale;
+      this.applyDisplayScale();
       this.pageInput.value = num;
       this.renderSelectionLayer();
       this.refreshImageLayer();
       this.refreshObjectsIfNeeded();
-
-      if (this.pageNumPending !== null) {
-        const pending = this.pageNumPending;
-        this.pageNumPending = null;
-        this.renderPage(pending);
+    } catch (error) {
+      if (this.session === session && !isCancelled(error, session)) {
+        console.error('Render error:', error);
+        this.statusText.textContent = 'Could not render page: ' + error.message;
       }
-    } catch (err) {
-      this.pageRendering = false;
-      console.error('Render error:', err);
+    } finally {
+      if (this.renderTask === job) {
+        this.pageRendering = false;
+        this.renderTask = null;
+        if (this.pageNumPending !== null && this.session === session) {
+          const pending = this.pageNumPending;
+          this.pageNumPending = null;
+          this.renderPage(pending);
+        }
+      }
     }
   }
 
@@ -506,8 +514,9 @@ class PdfCropper {
   }
 
   updateNav() {
-    this.prevBtn.disabled = this.pageNum <= 1;
-    this.nextBtn.disabled = this.pageNum >= this.pdfDoc.numPages;
+    const doc = this.pdfDoc;
+    this.prevBtn.disabled = !doc || this.pageNum <= 1;
+    this.nextBtn.disabled = !doc || this.pageNum >= doc.numPages;
   }
 
   // -------- Zoom --------
@@ -644,136 +653,24 @@ class PdfCropper {
 
   // -------- Image detection --------
 
-  /**
-   * Walks a page's operator list, tracking the current transform, and returns
-   * the bounding box of every image it paints. Boxes come back in the same
-   * PDF-point space that selections use, so one can become the other directly.
-   */
-  async detectImages(pageNum) {
-    if (this.imageCache.has(pageNum)) return this.imageCache.get(pageNum);
-
-    const job = (async () => {
-      const page = await this.pdfDoc.getPage(pageNum);
-      const opList = await page.getOperatorList();
-      const viewport = page.getViewport({ scale: 1.0 });
-      const base = viewport.transform;
-
-      const OPS = pdfjsLib.OPS;
-      // Stencil masks paint the current fill colour through a 1-bit shape
-      // instead of carrying colour of their own.
-      const MASK_OPS = new Set([
-        OPS.paintImageMaskXObject,
-        OPS.paintImageMaskXObjectGroup,
-        OPS.paintImageMaskXObjectRepeat,
-        OPS.paintSolidColorImageMask,
-      ]);
-      const IMAGE_OPS = new Set([
-        OPS.paintImageXObject,
-        OPS.paintImageXObjectRepeat,
-        OPS.paintInlineImageXObject,
-        OPS.paintInlineImageXObjectGroup,
-        OPS.paintImageMaskXObject,
-        OPS.paintImageMaskXObjectGroup,
-        OPS.paintImageMaskXObjectRepeat,
-        OPS.paintSolidColorImageMask,
-      ]);
-
-      let ctm = base;
-      const stack = [];
-      const boxes = [];
-
-      for (let i = 0; i < opList.fnArray.length; i++) {
-        const fn = opList.fnArray[i];
-        const args = opList.argsArray[i];
-
-        if (fn === OPS.save) {
-          stack.push(ctm);
-        } else if (fn === OPS.restore) {
-          ctm = stack.pop() || base;
-        } else if (fn === OPS.transform) {
-          ctm = mulMatrix(ctm, args);
-        } else if (fn === OPS.paintFormXObjectBegin) {
-          stack.push(ctm);
-          if (args && args[0]) ctm = mulMatrix(ctm, args[0]);
-        } else if (fn === OPS.paintFormXObjectEnd) {
-          ctm = stack.pop() || base;
-        } else if (IMAGE_OPS.has(fn)) {
-          // A PDF image always occupies the unit square in its own space.
-          const corners = [[0, 0], [1, 0], [0, 1], [1, 1]]
-            .map(([ux, uy]) => applyMatrix(ux, uy, ctm));
-          const xs = corners.map((c) => c[0]);
-          const ys = corners.map((c) => c[1]);
-          const x0 = Math.min(...xs);
-          const x1 = Math.max(...xs);
-          const y0 = Math.min(...ys);
-          const y1 = Math.max(...ys);
-          // An XObject names its decoded image in page.objs. A stencil mask
-          // passes an object whose `data` is that name, not the pixels. Only a
-          // true inline image carries its samples in the argument itself.
-          const ref = args && args[0];
-          let objId = null;
-          let inlineData = null;
-          if (typeof ref === 'string') {
-            objId = ref;
-          } else if (ref && typeof ref.data === 'string') {
-            objId = ref.data;
-          } else if (ref && typeof ref === 'object') {
-            inlineData = ref;
-          }
-
-          boxes.push({
-            x: Math.min(x0, x1),
-            y: Math.min(y0, y1),
-            w: Math.abs(x1 - x0),
-            h: Math.abs(y1 - y0),
-            objId,
-            inlineData,
-            isMask: MASK_OPS.has(fn),
-          });
-        }
-      }
-
-      return this.dedupeBoxes(boxes, viewport.width, viewport.height);
-    })();
-
-    this.imageCache.set(pageNum, job);
-    return job;
-  }
-
-  /** Drops slivers, page backgrounds and near-duplicates from the raw pass. */
-  dedupeBoxes(boxes, pageWidth, pageHeight) {
-    const MIN_SIDE = 12; // pt; smaller than this is a rule, bullet or artifact
-    // An image that fills the page is the page itself -- a scan, or a
-    // background. Clicking it would select everything, which is never what
-    // the click was for, so it is not offered as a target.
-    const MAX_COVERAGE = 0.9;
-    const pageArea = pageWidth * pageHeight;
-
-    const kept = [];
-    for (const b of boxes) {
-      if (b.w < MIN_SIDE || b.h < MIN_SIDE) continue;
-      if (pageArea > 0 && (b.w * b.h) / pageArea >= MAX_COVERAGE) continue;
-      const dup = kept.some((k) =>
-        Math.abs(k.x - b.x) < 1 && Math.abs(k.y - b.y) < 1 &&
-        Math.abs(k.w - b.w) < 1 && Math.abs(k.h - b.h) < 1);
-      if (!dup) kept.push(b);
-    }
-    // Largest first: the hit test walks backwards, so it meets the smallest
-    // (most specific) box first and a figure wins over the page background.
-    return kept.sort((a, b) => b.w * b.h - a.w * a.h);
+  detectImages(pageNum) {
+    return this.rasterExporter.detectImages(pageNum);
   }
 
   async refreshImageLayer() {
     if (!this.pdfDoc) return;
+    const session = this.session;
+    const exporter = this.rasterExporter;
     const pageNum = this.pageNum;
     let boxes = [];
     try {
-      boxes = await this.detectImages(pageNum);
+      boxes = await exporter.detectImages(pageNum);
     } catch (err) {
+      if (this.session !== session || isCancelled(err, session)) return;
       console.warn('Image detection failed:', err);
     }
     // The user may have paged away while detection was running.
-    if (pageNum !== this.pageNum) return;
+    if (this.session !== session || pageNum !== this.pageNum) return;
     this.pageImages = boxes;
     this.renderImageLayer();
   }
@@ -819,91 +716,8 @@ class PdfCropper {
 
   // -------- Object index --------
 
-  /**
-   * Builds the list of drawable objects on a page, each with its bounds in PDF
-   * points. Elements are tagged in the cached page SVG first, so a clone made
-   * later at export time can resolve the very same objects by id.
-   */
-  async buildPageObjects(pageNum) {
-    if (this.objectCache.has(pageNum)) return this.objectCache.get(pageNum);
-
-    const job = (async () => {
-      const pageSvg = await this.getPageSvg(pageNum);
-      const page = await this.pdfDoc.getPage(pageNum);
-      const viewport = page.getViewport({ scale: 1.0 });
-
-      // Tag first, then clone, so ids survive into every later copy.
-      const source = pageSvg.querySelectorAll(DRAWABLE_SELECTOR);
-      source.forEach((el, i) => el.setAttribute(OBJ_ATTR, String(i)));
-
-      const probe = pageSvg.cloneNode(true);
-      probe.setAttribute('viewBox', `0 0 ${viewport.width} ${viewport.height}`);
-      probe.setAttribute('width', String(viewport.width));
-      probe.setAttribute('height', String(viewport.height));
-
-      const holder = document.createElement('div');
-      holder.style.cssText =
-        'position:fixed;left:-20000px;top:0;opacity:0;pointer-events:none';
-      holder.appendChild(probe);
-      document.body.appendChild(holder);
-
-      const objects = [];
-      try {
-        const rootCTM = probe.getScreenCTM();
-        if (!rootCTM) return [];
-        const inv = rootCTM.inverse();
-
-        for (const el of probe.querySelectorAll(DRAWABLE_SELECTOR)) {
-          if (objects.length >= MAX_OBJECTS) break;
-
-          let box;
-          try {
-            const bbox = el.getBBox();
-            if (!bbox.width && !bbox.height) continue;
-            const ctm = el.getScreenCTM();
-            if (!ctm) continue;
-            // element local -> screen -> page user units, which are points
-            const m = inv.multiply(ctm);
-            const corners = [
-              [bbox.x, bbox.y],
-              [bbox.x + bbox.width, bbox.y],
-              [bbox.x, bbox.y + bbox.height],
-              [bbox.x + bbox.width, bbox.y + bbox.height],
-            ].map(([x, y]) => ({ x: m.a * x + m.c * y + m.e, y: m.b * x + m.d * y + m.f }));
-            const xs = corners.map((p) => p.x);
-            const ys = corners.map((p) => p.y);
-            box = {
-              x: Math.min(...xs), y: Math.min(...ys),
-              w: Math.max(...xs) - Math.min(...xs),
-              h: Math.max(...ys) - Math.min(...ys),
-            };
-          } catch (err) {
-            continue;
-          }
-
-          if (box.w < 0.5 && box.h < 0.5) continue;
-
-          const id = Number(el.getAttribute(OBJ_ATTR));
-          if (!Number.isFinite(id)) continue;
-
-          const tag = el.tagName.replace(/^svg:/, '').toLowerCase();
-          const type = tag === 'text' ? 'text' : tag === 'image' ? 'image' : 'vector';
-          const label = type === 'text'
-            ? ((el.textContent || '').trim().slice(0, 40) || 'Text')
-            : type === 'image'
-              ? `Image ${Math.round(box.w)} x ${Math.round(box.h)} pt`
-              : tag.charAt(0).toUpperCase() + tag.slice(1);
-
-          objects.push({ id, type, label, ...box });
-        }
-      } finally {
-        holder.remove();
-      }
-      return objects;
-    })();
-
-    this.objectCache.set(pageNum, job);
-    return job;
+  buildPageObjects(pageNum) {
+    return this.svgExporter.buildPageObjects(pageNum);
   }
 
   /** Objects whose bounds intersect a selection. */
@@ -937,14 +751,18 @@ class PdfCropper {
 
   async refreshObjects() {
     if (!this.pdfDoc) return;
+    const session = this.session;
+    const exporter = this.svgExporter;
     const pageNum = this.pageNum;
     let objects = [];
     try {
-      objects = await this.buildPageObjects(pageNum);
+      objects = await exporter.buildPageObjects(pageNum);
     } catch (err) {
+      if (this.session !== session || isCancelled(err, session)) return;
       console.warn('Object index failed:', err);
     }
-    if (pageNum !== this.pageNum) return;
+    if (this.session !== session || this.svgExporter !== exporter ||
+        pageNum !== this.pageNum || !this.objectsNeeded()) return;
     this.pageObjects = objects;
     this.renderObjectLayer();
     this.renderObjectsPanel();
@@ -1374,7 +1192,7 @@ class PdfCropper {
     this.renderLibrary();
     this.renderObjectLayer();
     this.buildPreview(sel);
-    this.downloadBtn.disabled = false;
+    this.updateDownloadButton();
     this.updateEditButton();
     if (sel.source !== 'image') this.refreshObjects();
     else this.renderObjectsPanel();
@@ -1385,16 +1203,17 @@ class PdfCropper {
     const idx = this.selections.findIndex((s) => s.id === id);
     if (idx === -1) return;
     const [sel] = this.selections.splice(idx, 1);
-    if (sel.previewUrl) URL.revokeObjectURL(sel.previewUrl);
+    this.previewStore.remove(sel);
     if (this.activeId === id) this.activeId = null;
-    this.downloadBtn.disabled = this.activeId === null;
+    this.updateDownloadButton();
+    this.updateEditButton();
     this.renderSelectionLayer();
     this.renderLibrary();
   }
 
   setActive(id) {
     this.activeId = id;
-    this.downloadBtn.disabled = id === null;
+    this.updateDownloadButton();
     this.updateEditButton();
     this.renderSelectionLayer();
     this.renderLibrary();
@@ -1445,589 +1264,35 @@ class PdfCropper {
     }
   }
 
-  // -------- SVG export via MuPDF --------
+  // -------- Export and preview --------
 
-  /**
-   * Loads MuPDF on first use. It carries a ~10 MB WebAssembly payload, so it is
-   * imported lazily: viewing a PDF never pays for it, only exporting does.
-   */
-  getMu() {
-    if (!this.muPromise) {
-      this.muPromise = import('mupdf');
-    }
-    return this.muPromise;
+  buildSvgDom(sel) {
+    return this.svgExporter.buildSvgDom(sel);
   }
 
-  async getMuDoc() {
-    if (!this.muDocPromise) {
-      this.muDocPromise = (async () => {
-        const mupdf = await this.getMu();
-        return mupdf.Document.openDocument(this.pdfBytes, 'application/pdf');
-      })();
+  async buildExport(sel, rasterExporter = this.rasterExporter, svgExporter = this.svgExporter) {
+    // Capture the exporter before awaiting; a new PDF owns new exporters.
+    if (sel.source === 'image') {
+      const raster = await rasterExporter.buildRaster(sel);
+      return { blob: raster.blob, format: 'png',
+        pixelWidth: raster.width, pixelHeight: raster.height };
     }
-    return this.muDocPromise;
+    const svgString = await svgExporter.buildSvg(sel);
+    return { blob: new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' }),
+      format: 'svg', svgString, pixelWidth: undefined, pixelHeight: undefined };
   }
 
-  /**
-   * MuPDF's SVG writer options. Keeping text as text produces a far smaller
-   * file with real, selectable <text> runs; outlines are larger but render
-   * identically anywhere, because they do not depend on the viewer's fonts.
-   */
-  svgWriterOptions() {
-    return this.textAsOutlines ? 'text=path' : 'text=text';
+  buildPreview(sel) {
+    const raster = this.rasterExporter, svg = this.svgExporter;
+    return this.previewStore.buildPreview(sel, (snapshot) => this.buildExport(snapshot, raster, svg));
   }
 
-  /**
-   * Writes a region straight out of MuPDF. Unlike a viewBox window, this emits
-   * only what falls inside the box, so a crop costs what the crop contains.
-   * Coordinates are PDF points with a top-left origin, matching selections.
-   */
-  async muSvg(pageNum, box) {
-    const mupdf = await this.getMu();
-    const doc = await this.getMuDoc();
+  get pdfDoc() { return this.session?.pdfDoc || null; }
 
-    let page = null;
-    let writer = null;
-    let device = null;
-    const out = new mupdf.Buffer();
-    try {
-      page = doc.loadPage(pageNum - 1);
-      const rect = box || page.getBounds();
-      writer = new mupdf.DocumentWriter(out, 'svg', this.svgWriterOptions());
-      device = writer.beginPage(rect);
-      // beginPage sets the viewport to "0 0 w h" but the page still draws in
-      // page coordinates, so the content has to be shifted to meet it.
-      // Without this, every crop shows the top-left corner of the page.
-      page.run(device, [1, 0, 0, 1, -rect[0], -rect[1]]);
-      device.close();
-      writer.endPage();
-      writer.close();
-      return new TextDecoder().decode(out.asUint8Array());
-    } finally {
-      // WASM memory is not garbage collected for us.
-      for (const obj of [device, writer, page, out]) {
-        try { obj?.destroy?.(); } catch (err) { /* already gone */ }
-      }
-    }
-  }
-
-  // -------- Raster export (for images clicked on the page) --------
-
-  /**
-   * Resolves a decoded image from a page's object store. Images land there
-   * while the operator list is built, but may not have arrived yet.
-   */
-  getImageObject(page, objId) {
-    return new Promise((resolve, reject) => {
-      try {
-        if (page.objs.has(objId)) {
-          resolve(page.objs.get(objId));
-          return;
-        }
-        page.objs.get(objId, resolve);
-        setTimeout(() => reject(new Error(`Timed out reading image ${objId}`)), 15000);
-      } catch (err) {
-        reject(err);
-      }
-    });
-  }
-
-  /**
-   * Paints a decoded PDF image onto a canvas at its native pixel size.
-   * PDF.js hands back either an ImageBitmap or raw samples in one of a few
-   * pixel layouts, so each has to be expanded to RGBA by hand.
-   */
-  imageToCanvas(img, isMask = false) {
-    const width = img.width;
-    const height = img.height;
-    if (!width || !height) throw new Error('Image has no dimensions');
-
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-
-    if (img.bitmap && !isMask) {
-      ctx.drawImage(img.bitmap, 0, 0);
-      return canvas;
-    }
-
-    const src = img.data;
-    if (!src) throw new Error('Image has no pixel data');
-
-    const out = ctx.createImageData(width, height);
-    const dst = out.data;
-    const ImageKind = pdfjsLib.ImageKind || {
-      GRAYSCALE_1BPP: 1, RGB_24BPP: 2, RGBA_32BPP: 3,
-    };
-
-    if (isMask) {
-      // A stencil paints where the bit is clear and leaves the rest alone, so
-      // it exports as black artwork on transparency rather than on white.
-      const rowBytes = (width + 7) >> 3;
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          const bit = (src[y * rowBytes + (x >> 3)] >> (7 - (x & 7))) & 1;
-          const o = (y * width + x) * 4;
-          dst[o] = dst[o + 1] = dst[o + 2] = 0;
-          dst[o + 3] = bit ? 0 : 255;
-        }
-      }
-    } else if (img.kind === ImageKind.RGBA_32BPP) {
-      dst.set(src.subarray(0, dst.length));
-    } else if (img.kind === ImageKind.RGB_24BPP) {
-      for (let i = 0, j = 0; i < width * height; i++, j += 3) {
-        dst[i * 4] = src[j];
-        dst[i * 4 + 1] = src[j + 1];
-        dst[i * 4 + 2] = src[j + 2];
-        dst[i * 4 + 3] = 255;
-      }
-    } else {
-      // GRAYSCALE_1BPP: one bit per pixel, rows padded to whole bytes, and
-      // a set bit means black.
-      const rowBytes = (width + 7) >> 3;
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          const bit = (src[y * rowBytes + (x >> 3)] >> (7 - (x & 7))) & 1;
-          const v = bit ? 0 : 255;
-          const o = (y * width + x) * 4;
-          dst[o] = dst[o + 1] = dst[o + 2] = v;
-          dst[o + 3] = 255;
-        }
-      }
-    }
-
-    ctx.putImageData(out, 0, 0);
-    return canvas;
-  }
-
-  canvasToBlob(canvas, type = 'image/png') {
-    return new Promise((resolve, reject) => {
-      canvas.toBlob(
-        (blob) => (blob ? resolve(blob) : reject(new Error('Encoding failed'))),
-        type);
-    });
-  }
-
-  /**
-   * Falls back to cropping a high-resolution render of the page, used when the
-   * decoded image itself cannot be reached.
-   */
-  async rasterizeRegion(sel, targetScale) {
-    const page = await this.pdfDoc.getPage(sel.page);
-    const viewport = page.getViewport({ scale: targetScale });
-    const full = document.createElement('canvas');
-    full.width = Math.ceil(viewport.width);
-    full.height = Math.ceil(viewport.height);
-    await page.render({ canvasContext: full.getContext('2d'), viewport }).promise;
-
-    const crop = document.createElement('canvas');
-    crop.width = Math.max(1, Math.round(sel.w * targetScale));
-    crop.height = Math.max(1, Math.round(sel.h * targetScale));
-    crop.getContext('2d').drawImage(
-      full,
-      Math.round(sel.x * targetScale), Math.round(sel.y * targetScale),
-      crop.width, crop.height,
-      0, 0, crop.width, crop.height);
-    return crop;
-  }
-
-  /** Builds the PNG for an image selection, at the image's own resolution. */
-  async buildRaster(sel) {
-    const page = await this.pdfDoc.getPage(sel.page);
-
-    let canvas = null;
-    try {
-      const img = sel.inlineData
-        ? sel.inlineData
-        : await this.getImageObject(page, sel.objId);
-      canvas = this.imageToCanvas(img, !!sel.isMask);
-    } catch (err) {
-      console.warn('Native image read failed, rendering the region instead:', err);
-      // Render at the image's own pixel density so nothing is thrown away.
-      const scale = Math.min(8, Math.max(2, 300 / 72));
-      canvas = await this.rasterizeRegion(sel, scale);
-    }
-
-    const blob = await this.canvasToBlob(canvas, 'image/png');
-    return { blob, width: canvas.width, height: canvas.height };
-  }
-
-  /**
-   * Renders a whole page to SVG once and caches it as a DOM element. This backs
-   * the object index and any export that has to filter individual objects.
-   */
-  getPageSvg(pageNum) {
-    if (!this.pageSvgCache.has(pageNum)) {
-      const job = (async () => {
-        const text = await this.muSvg(pageNum, null);
-        const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
-        const root = doc.documentElement;
-        if (!root || root.tagName === 'parsererror') {
-          throw new Error('Could not parse the page SVG');
-        }
-        return root;
-      })();
-      this.pageSvgCache.set(pageNum, job);
-    }
-    return this.pageSvgCache.get(pageNum);
-  }
-
-  /**
-   * Drops content that falls entirely outside the crop. MuPDF writes the whole
-   * page and lets the viewport do the cropping, so without this every crop
-   * carries the rest of the page: each image as a base64 payload, every line
-   * of text as a run that pulls its font in with it, and, with text as
-   * outlines, every glyph on the page as a path. SVGO's own off-canvas pass
-   * gives up on anything carrying a transform, which is all of it.
-   *
-   * Geometry is compared in screen space, which is the one coordinate system
-   * both the root's viewBox mapping and each element's transform chain agree
-   * on. The element must be in the document for the browser to resolve those.
-   * Only content that misses the crop outright goes: a stroke can paint well
-   * outside its own geometry, so the box grows by the stroke before the test,
-   * and anything that cannot be measured stays.
-   */
-  pruneOffCanvas(svgElement, crop, selector = 'image, text, path, use') {
-    const candidates = svgElement.querySelectorAll(selector);
-    if (!candidates.length) return 0;
-
-    const holder = document.createElement('div');
-    holder.style.cssText =
-      'position:fixed;left:-20000px;top:0;width:1000px;height:1000px;opacity:0;pointer-events:none';
-    holder.appendChild(svgElement);
-    document.body.appendChild(holder);
-
-    let removed = 0;
-    try {
-      const rootCTM = svgElement.getScreenCTM();
-      if (!rootCTM) return 0;
-
-      const toScreen = (m, x, y) => ({
-        x: m.a * x + m.c * y + m.e,
-        y: m.b * x + m.d * y + m.f,
-      });
-
-      // The crop rectangle, in screen space.
-      const c0 = toScreen(rootCTM, crop.x, crop.y);
-      const c1 = toScreen(rootCTM, crop.x + crop.w, crop.y + crop.h);
-      const cropBox = {
-        x0: Math.min(c0.x, c1.x), x1: Math.max(c0.x, c1.x),
-        y0: Math.min(c0.y, c1.y), y1: Math.max(c0.y, c1.y),
-      };
-
-      for (const el of [...candidates]) {
-        // Definitions are referenced from elsewhere, so where they sit says
-        // nothing about where they paint.
-        if (el.closest('defs, clipPath, mask, pattern, marker, symbol')) continue;
-
-        let box;
-        try {
-          const bbox = el.getBBox();
-          const ctm = el.getScreenCTM();
-          if (!ctm || !bbox.width || !bbox.height) continue;
-          // A stroke is centred on the path, so it reaches half its width
-          // past the geometry on every side. Both properties inherit, so the
-          // value that applies may sit on an ancestor.
-          const stroke = el.closest('[stroke]')?.getAttribute('stroke');
-          const width = parseFloat(
-            el.closest('[stroke-width]')?.getAttribute('stroke-width') ?? '1');
-          const pad = stroke && stroke !== 'none'
-            ? (Number.isFinite(width) ? width : 1) / 2
-            : 0;
-          const pts = [
-            toScreen(ctm, bbox.x - pad, bbox.y - pad),
-            toScreen(ctm, bbox.x + bbox.width + pad, bbox.y - pad),
-            toScreen(ctm, bbox.x - pad, bbox.y + bbox.height + pad),
-            toScreen(ctm, bbox.x + bbox.width + pad, bbox.y + bbox.height + pad),
-          ];
-          const xs = pts.map((p) => p.x);
-          const ys = pts.map((p) => p.y);
-          box = {
-            x0: Math.min(...xs), x1: Math.max(...xs),
-            y0: Math.min(...ys), y1: Math.max(...ys),
-          };
-        } catch (err) {
-          continue; // Un-measurable: keep it rather than risk losing content.
-        }
-
-        const disjoint =
-          box.x1 <= cropBox.x0 || box.x0 >= cropBox.x1 ||
-          box.y1 <= cropBox.y0 || box.y0 >= cropBox.y1;
-        if (disjoint) {
-          el.remove();
-          removed++;
-        }
-      }
-      if (removed) removed += this.pruneUnusedDefs(svgElement);
-    } finally {
-      holder.remove();
-    }
-    return removed;
-  }
-
-  /**
-   * Drops definitions nothing refers to any more. With text as outlines MuPDF
-   * defines every glyph on the page once and draws it with <use>, so pruning
-   * the draws leaves the shapes behind unless they go too.
-   */
-  pruneUnusedDefs(svgElement) {
-    const defs = [...svgElement.querySelectorAll('defs > *')].filter((el) => el.id);
-    if (!defs.length) return 0;
-
-    // Every way one element can name another: url(#id) in a presentation
-    // attribute or a style declaration, and a plain #id in href.
-    const referenced = new Set();
-    for (const el of svgElement.querySelectorAll('*')) {
-      for (const { value } of el.attributes) {
-        for (const m of value.matchAll(/url\(\s*['"]?#([^)'"\s]+)/g)) {
-          referenced.add(m[1]);
-        }
-        if (value.startsWith('#')) referenced.add(value.slice(1));
-      }
-    }
-
-    let removed = 0;
-    for (const el of defs) {
-      // A definition can be referenced by another definition.
-      if (referenced.has(el.id)) continue;
-      el.remove();
-      removed++;
-    }
-    return removed;
-  }
-
-  /**
-   * The fonts PDF.js parsed for a page, as font objects carrying the repaired
-   * OpenType program plus the character-code tables that go with it.
-   *
-   * PDF.js builds these to render the page and hands them over the worker
-   * boundary; asking for the operator list is what makes them arrive, and it
-   * is cached, so a page already on screen costs nothing here.
-   */
-  getPageFonts(pageNum) {
-    if (!this.pageFontCache.has(pageNum)) {
-      const job = (async () => {
-        const page = await this.pdfDoc.getPage(pageNum);
-        const ops = await page.getOperatorList();
-        const names = new Set();
-        ops.fnArray.forEach((fn, i) => {
-          if (fn === pdfjsLib.OPS.setFont) names.add(ops.argsArray[i][0]);
-        });
-
-        const fonts = [];
-        for (const name of names) {
-          if (!page.commonObjs.has(name)) continue;
-          const font = page.commonObjs.get(name);
-          // Type 3 fonts are drawing procedures, not font programs.
-          if (font && !font.isType3Font) fonts.push(font);
-        }
-        return fonts;
-      })().catch((err) => {
-        console.warn(`Could not read the fonts on page ${pageNum}:`, err);
-        return [];
-      });
-      this.pageFontCache.set(pageNum, job);
-    }
-    return this.pageFontCache.get(pageNum);
-  }
-
-  /**
-   * Carries the PDF's fonts into the SVG.
-   *
-   * MuPDF names the font each text run was drawn with but cannot embed it, and
-   * a subset name like `NNFDFE+Arial` matches nothing anywhere, so on its own
-   * the export falls back to whatever the viewer feels like. Matching those
-   * names back to the page's fonts and writing them in as `@font-face` rules
-   * makes the text render in the typeface it was set in, while staying text
-   * that can be selected, searched and edited.
-   */
-  async embedFonts(root, pageNum) {
-    const texts = [...root.querySelectorAll('text')];
-    if (!texts.length) return 0;
-
-    // The family an element asks for, reading past a stack this may have
-    // already been run on.
-    const askedFor = (el) => {
-      const family = (el.getAttribute('font-family') || '')
-        .split(',')[0].trim().replace(/^['"]|['"]$/g, '');
-      if (!family) return null;
-      return {
-        family,
-        bold: /bold|^[6-9]00$/.test(el.getAttribute('font-weight') || ''),
-        italic: /italic|oblique/.test(el.getAttribute('font-style') || ''),
-      };
-    };
-
-    const usages = new Map();
-    for (const el of texts) {
-      const usage = askedFor(el);
-      if (!usage) continue;
-      const seen = usages.get(usageKey(usage));
-      // What a run spells out is what identifies its font when the name does
-      // not; a few hundred characters are plenty to tell the fonts apart.
-      if (!seen) usages.set(usageKey(usage), { ...usage, text: el.textContent });
-      else if (seen.text.length < 2000) seen.text += el.textContent;
-    }
-    if (!usages.size) return 0;
-
-    const fonts = await this.getPageFonts(pageNum);
-    if (!fonts.length) return 0;
-
-    const { css, stacks, embedded } = buildFontCss([...usages.values()], fonts);
-    for (const el of texts) {
-      const usage = askedFor(el);
-      const stack = usage && stacks.get(usageKey(usage));
-      if (stack) el.setAttribute('font-family', stack);
-    }
-
-    if (css) {
-      const style = root.ownerDocument.createElementNS(SVG_NS, 'style');
-      style.textContent = css;
-      root.insertBefore(style, root.firstChild);
-    }
-    return embedded;
-  }
-
-  /** Builds the SVG string for one selection, cropped and optimized. */
-  /** Builds the SVG string for one selection, cropped and optimized. */
-  /**
-   * Builds the DOM for a selection, with every drawable tagged. The editor and
-   * the exporter both go through here, so an element the user deletes in the
-   * editor is the same element the exporter drops.
-   */
-  async buildSvgDom(sel) {
-    const filtering = !!(sel.objectIds || (sel.hiddenIds && sel.hiddenIds.length));
-
-    let root;
-    if (!filtering) {
-      const raw = await this.muSvg(
-        sel.page, [sel.x, sel.y, sel.x + sel.w, sel.y + sel.h]);
-      const doc = new DOMParser().parseFromString(raw, 'image/svg+xml');
-      root = doc.documentElement;
-      if (!root || root.tagName === 'parsererror') {
-        throw new Error('Could not parse the exported SVG');
-      }
-    } else {
-      // Individual objects are being excluded, which means working from the
-      // indexed whole-page render and windowing it afterwards.
-      const pageSvg = await this.getPageSvg(sel.page);
-      await this.buildPageObjects(sel.page);
-      root = pageSvg.cloneNode(true);
-
-      if (sel.objectIds) {
-        const keep = new Set(sel.objectIds.map(String));
-        for (const el of [...root.querySelectorAll(`[${OBJ_ATTR}]`)]) {
-          if (!keep.has(el.getAttribute(OBJ_ATTR))) el.remove();
-        }
-      }
-      for (const id of sel.hiddenIds || []) {
-        const el = root.querySelector(`[${OBJ_ATTR}="${id}"]`);
-        if (el) el.remove();
-      }
-      for (const el of root.querySelectorAll(`[${OBJ_ATTR}]`)) {
-        el.removeAttribute(OBJ_ATTR);
-      }
-
-      root.setAttribute('viewBox', `${sel.x} ${sel.y} ${sel.w} ${sel.h}`);
-      root.setAttribute('width', sel.w + 'pt');
-      root.setAttribute('height', sel.h + 'pt');
-    }
-
-    // A MuPDF crop draws in its own coordinates, a windowed page render in the
-    // page's; the viewBox is what says which, and is the crop either way.
-    const viewBox = (root.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
-    const crop = viewBox.length === 4 && viewBox.every(Number.isFinite)
-      ? { x: viewBox[0], y: viewBox[1], w: viewBox[2], h: viewBox[3] }
-      : sel;
-    this.pruneOffCanvas(root, crop);
-    await this.embedFonts(root, sel.page);
-
-    // Tag in document order. Generation is deterministic for a given page,
-    // box and text mode, so these ids are stable across rebuilds.
-    root.querySelectorAll(DRAWABLE_SELECTOR)
-      .forEach((el, i) => el.setAttribute(EDIT_ATTR, String(i)));
-    return root;
-  }
-
-  /** Builds the SVG string for one selection, with edits applied. */
-  async buildSvg(sel) {
-    const root = await this.buildSvgDom(sel);
-
-    for (const id of sel.deletedIds || []) {
-      const el = root.querySelector(`[${EDIT_ATTR}="${id}"]`);
-      if (el) el.remove();
-    }
-    for (const el of root.querySelectorAll(`[${EDIT_ATTR}]`)) {
-      el.removeAttribute(EDIT_ATTR);
-    }
-
-    let svgString = new XMLSerializer().serializeToString(root);
-    try {
-      svgString = svgOptimize(svgString, {
-        plugins: [
-          {
-            name: 'preset-default',
-            params: {
-              overrides: {
-                // The @font-face rules carry the embedded fonts. Inlining
-                // turns rules into presentation attributes, which an at-rule
-                // cannot become, and minifying re-parses a megabyte of base64
-                // for nothing.
-                inlineStyles: false,
-                minifyStyles: false,
-              },
-            },
-          },
-          'removeOffCanvasPaths',
-        ],
-      }).data;
-    } catch (svgoErr) {
-      console.warn('SVGO optimization failed, using raw SVG:', svgoErr);
-    }
-    return svgString;
-  }
-
-  /**
-   * Generates the export for a selection and stores it on the selection so the
-   * library shows the real SVG rather than a raster approximation.
-   */
-  async buildPreview(sel) {
-    const token = (sel.previewToken || 0) + 1;
-    sel.previewToken = token;
-    sel.previewState = 'pending';
-    this.renderLibrary();
-
-    try {
-      let blob;
-      if (sel.source === 'image') {
-        const raster = await this.buildRaster(sel);
-        blob = raster.blob;
-        sel.format = 'png';
-        sel.pixelWidth = raster.width;
-        sel.pixelHeight = raster.height;
-        sel.blob = blob;
-      } else {
-        const svgString = await this.buildSvg(sel);
-        blob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
-        sel.format = 'svg';
-        sel.svgString = svgString;
-        sel.blob = blob;
-      }
-      // A newer build started while this one was running.
-      if (sel.previewToken !== token) return;
-
-      if (sel.previewUrl) URL.revokeObjectURL(sel.previewUrl);
-      sel.previewUrl = URL.createObjectURL(blob);
-      sel.byteSize = blob.size;
-      sel.previewState = 'ready';
-    } catch (err) {
-      console.error('Preview failed:', err);
-      if (sel.previewToken !== token) return;
-      sel.previewState = 'error';
-      sel.previewError = err.message;
-    }
-    this.renderLibrary();
+  updateDownloadButton() {
+    if (!this.downloadBtn) return;
+    const sel = this.selections.find((s) => s.id === this.activeId);
+    this.downloadBtn.disabled = !sel || sel.previewState !== 'ready';
   }
 
   fileNameFor(sel) {
@@ -2047,45 +1312,50 @@ class PdfCropper {
   }
 
   downloadSelection(sel) {
-    if (!sel.blob) return;
+    if (!this.selections.includes(sel) || sel.previewState !== 'ready' || !sel.blob) return;
     this.saveBlob(sel.blob, this.fileNameFor(sel));
   }
 
   async handleDownload() {
     const sel = this.selections.find((s) => s.id === this.activeId);
-    if (!sel) return;
-
+    const session = this.session;
+    if (!sel || !session) return;
     const originalText = this.downloadBtn.textContent;
     this.downloadBtn.textContent = 'Generating...';
     this.downloadBtn.disabled = true;
     try {
-      if (!sel.blob) await this.buildPreview(sel);
+      await this.previewStore.ensureReady(sel);
+      if (this.session !== session || !this.selections.includes(sel)) return;
       this.downloadSelection(sel);
-      this.statusText.textContent =
-        `${(sel.format || 'svg').toUpperCase()} downloaded!`;
-    } catch (err) {
-      console.error('SVG export error:', err);
-      alert('Error generating SVG: ' + err.message);
+      this.statusText.textContent = `${sel.format.toUpperCase()} downloaded!`;
+    } catch (error) {
+      if (isCancelled(error, session)) return;
+      console.error('Export failed:', error);
+      alert('Error generating export: ' + error.message);
     } finally {
       this.downloadBtn.textContent = originalText;
-      this.downloadBtn.disabled = false;
+      this.updateDownloadButton();
     }
   }
 
   async exportAll() {
     if (!this.selections.length) return;
 
+    const session = this.session;
+    const selections = this.selections.slice();
+    const pdfName = this.pdfName;
     const originalText = this.exportAllBtn.textContent;
     this.exportAllBtn.disabled = true;
     try {
       // Make sure every selection has been built before packing anything.
       const files = {};
       const used = new Set();
-      for (const sel of this.selections) {
+      for (const sel of selections) {
         this.exportAllBtn.textContent =
-          `Preparing ${this.selections.indexOf(sel) + 1}/${this.selections.length}...`;
-        if (!sel.blob) await this.buildPreview(sel);
-        if (!sel.blob) continue;
+          `Preparing ${selections.indexOf(sel) + 1}/${selections.length}...`;
+        const blob = await this.previewStore.ensureReady(sel);
+        session.assertActive();
+        if (this.session !== session) return;
 
         // Keep names unique even if two selections would collide.
         let name = this.fileNameFor(sel);
@@ -2094,9 +1364,10 @@ class PdfCropper {
           name = `${name.slice(0, dot)}-${sel.id}${name.slice(dot)}`;
         }
         used.add(name);
-        files[name] = new Uint8Array(await sel.blob.arrayBuffer());
+        files[name] = new Uint8Array(await blob.arrayBuffer());
       }
 
+      session.assertActive();
       const names = Object.keys(files);
       if (!names.length) return;
 
@@ -2118,29 +1389,34 @@ class PdfCropper {
         zipAsync(opts, (err, data) => (err ? reject(err) : resolve(data)));
       });
 
+      session.assertActive();
+      if (this.session !== session) return;
       this.saveBlob(
         new Blob([zipped], { type: 'application/zip' }),
-        `${this.pdfName}-selections.zip`);
+        `${pdfName}-selections.zip`);
       this.statusText.textContent =
         `Exported ${names.length} files as a zip`;
     } catch (err) {
+      if (isCancelled(err, session)) return;
       console.error('Export all failed:', err);
       alert('Error exporting: ' + err.message);
     } finally {
       this.exportAllBtn.textContent = originalText;
-      this.exportAllBtn.disabled = false;
+      this.exportAllBtn.disabled = this.selections.length === 0;
     }
   }
 
   clearLibrary() {
     for (const sel of this.selections) {
-      if (sel.previewUrl) URL.revokeObjectURL(sel.previewUrl);
+      this.previewStore.remove(sel);
     }
     this.selections = [];
     this.activeId = null;
     this.nextId = 1;
     this.downloadBtn.disabled = true;
+    this.updateEditButton();
     this.renderSelectionLayer();
+    this.renderObjectsPanel();
     this.renderLibrary();
   }
 
@@ -2154,6 +1430,9 @@ class PdfCropper {
   async openEditor(sel) {
     if (!sel || sel.source === 'image') return;
 
+    const session = this.session;
+    const token = (this.editorToken || 0) + 1;
+    this.editorToken = token;
     this.editorSel = sel;
     this.editorDeleted = new Set(sel.deletedIds || []);
     this.editorSelected = null;
@@ -2168,9 +1447,12 @@ class PdfCropper {
     try {
       root = await this.buildSvgDom(sel);
     } catch (err) {
+      if (this.editorToken !== token || this.session !== session || isCancelled(err, session)) return;
       this.editorTitle.textContent = 'Could not open: ' + err.message;
       return;
     }
+
+    if (this.editorToken !== token || this.session !== session || this.editorSel !== sel) return;
 
     // Fit the stage rather than the original point size.
     root.removeAttribute('width');
@@ -2347,6 +1629,7 @@ class PdfCropper {
 
   /** Commits the edits back onto the selection and re-exports. */
   closeEditor(save) {
+    this.editorToken = (this.editorToken || 0) + 1;
     this.editorOverlay.classList.add('hidden');
     const sel = this.editorSel;
     this.editorSel = null;
@@ -2450,8 +1733,7 @@ class PdfCropper {
 
       // Clicking an entry selects it, jumping to its page if needed.
       item.addEventListener('click', () => {
-        this.activeId = sel.id;
-        this.downloadBtn.disabled = false;
+        this.setActive(sel.id);
         if (sel.page !== this.pageNum) {
           this.goToPage(sel.page);
         } else {
